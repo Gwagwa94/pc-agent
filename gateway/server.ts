@@ -63,10 +63,11 @@ app.use(
     secret: SESSION_SEC,
     resave: false,
     saveUninitialized: false,
+    proxy: true,                             // Trust reverse proxy for X-Forwarded-Proto
     cookie: {
       httpOnly: true,
-      sameSite: 'strict',
-      secure: process.env.HTTPS === 'true',   // set HTTPS=true when behind TLS terminator (Caddy)
+      sameSite: 'lax',                       // 'lax' allows cookie preservation across 302 redirects
+      secure: 'auto',                        // 'auto' detects HTTPS automatically (works on https://domain and http://IP:14000)
       maxAge: 7 * 24 * 60 * 60 * 1000,       // 7 days
     },
   })
@@ -176,7 +177,10 @@ app.post('/login', async (req, res) => {
   const { username, password } = req.body as { username: string; password: string };
   if (username === USERNAME && await bcrypt.compare(password, PASS_HASH)) {
     req.session.authenticated = true;
-    req.session.save(() => res.redirect('/'));
+    req.session.save((err) => {
+      if (err) console.error('Session save error:', err);
+      res.redirect('/');
+    });
   } else {
     res.redirect('/login?error=1');
   }
