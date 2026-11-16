@@ -10,7 +10,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
-import connectSqlite3 from 'connect-sqlite3';
+import sessionFileStore from 'session-file-store';
 
 dotenv.config();
 
@@ -29,9 +29,9 @@ if (!PASS_HASH) {
   process.exit(1);
 }
 
-// ── Session store (SQLite — survives server & container restarts) ─────────────
-const SQLiteStore = connectSqlite3(session);
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+// ── Session store (FileStore — survives server & container restarts) ──────────
+const FileStore = sessionFileStore(session);
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'sessions');
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
@@ -46,7 +46,12 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use(
   session({
-    store: new SQLiteStore({ db: 'sessions.sqlite', dir: DATA_DIR }) as session.Store,
+    store: new FileStore({
+      path: DATA_DIR,
+      ttl: 7 * 24 * 60 * 60, // 7 days in seconds
+      retries: 1,
+      logFn: () => {},       // quiet
+    }),
     secret: SESSION_SEC,
     resave: false,
     saveUninitialized: false,
