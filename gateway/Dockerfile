@@ -10,6 +10,7 @@ RUN npm install --production=false
 COPY . .
 
 # Session DB volume
+ENV DATA_DIR=/data
 VOLUME ["/data"]
 
 EXPOSE 8080

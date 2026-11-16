@@ -29,23 +29,31 @@ if (!PASS_HASH) {
   process.exit(1);
 }
 
-// ── Session store (SQLite — survives container restarts) ─────────────────────
+// ── Session store (SQLite — survives server & container restarts) ─────────────
 const SQLiteStore = connectSqlite3(session);
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
 const app = express();
+
+// Trust reverse proxy (Caddy / Nginx) so HTTPS cookie forwarding works
+app.set('trust proxy', 1);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.use(
   session({
-    store: new SQLiteStore({ db: 'sessions.sqlite', dir: '/data' }) as session.Store,
+    store: new SQLiteStore({ db: 'sessions.sqlite', dir: DATA_DIR }) as session.Store,
     secret: SESSION_SEC,
     resave: false,
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
       sameSite: 'strict',
-      secure: process.env.HTTPS === 'true',   // set HTTPS=true when behind TLS terminator
+      secure: process.env.HTTPS === 'true',   // set HTTPS=true when behind TLS terminator (Caddy)
       maxAge: 7 * 24 * 60 * 60 * 1000,       // 7 days
     },
   })
