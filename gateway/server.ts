@@ -17,7 +17,7 @@ dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── Config ──────────────────────────────────────────────────────────────────
-const PORT         = Number(process.env.GATEWAY_PORT)    || 8080;
+const PORT         = Number(process.env.GATEWAY_PORT)    || 14000;
 const USERNAME     = process.env.GATEWAY_USER            || 'admin';
 const PASS_HASH    = process.env.GATEWAY_PASS_HASH        || '';  // bcrypt hash
 const SESSION_SEC  = process.env.SESSION_SECRET           || 'change-me-in-production';
@@ -31,9 +31,17 @@ if (!PASS_HASH) {
 
 // ── Session store (FileStore — survives server & container restarts) ──────────
 const FileStore = sessionFileStore(session);
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'sessions');
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'sessions');
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function resolveDashboardPath(): string {
+  const direct = path.join(__dirname, 'dashboard.html');
+  if (fs.existsSync(direct)) return direct;
+  const parent = path.join(__dirname, '..', 'dashboard.html');
+  if (fs.existsSync(parent)) return parent;
+  return path.join(process.cwd(), 'dashboard.html');
 }
 
 const app = express();
@@ -181,7 +189,7 @@ app.post('/logout', (req, res) => {
 
 // Dashboard (self-contained SPA)
 app.get('/', requireAuthPage, (_req, res) => {
-  res.sendFile(path.join(__dirname, 'dashboard.html'));
+  res.sendFile(resolveDashboardPath());
 });
 
 // ── Authenticated API proxy routes ───────────────────────────────────────────

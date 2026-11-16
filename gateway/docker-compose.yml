@@ -3,7 +3,7 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "14000:14000"
     env_file: .env
     volumes:
       - sessions:/data

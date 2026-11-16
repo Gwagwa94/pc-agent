@@ -13,6 +13,6 @@ COPY . .
 ENV DATA_DIR=/data
 VOLUME ["/data"]
 
-EXPOSE 8080
+EXPOSE 14000
 
 CMD ["npx", "tsx", "server.ts"]
