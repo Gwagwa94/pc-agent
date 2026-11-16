@@ -24,14 +24,26 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Middleware de log des requêtes entrantes ─────────────────────────────────
+app.use((req, _res, next) => {
+  addLog(`🌐 [AGENT HTTP ${req.method}] ${req.url} depuis ${req.ip}`);
+  next();
+});
+
 // ── API_SECRET guard: protect sensitive endpoints from unauthorized callers ───
 // If API_SECRET is set in .env, every call to /status, /command, /snapshot.png
 // must carry the matching X-Agent-Secret header (sent by the gateway).
 const API_SECRET = process.env.API_SECRET || '';
 
 function requireSecret(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (!API_SECRET) return next(); // secret not configured → open (local use only)
-  if (req.headers['x-agent-secret'] === API_SECRET) return next();
+  const incoming = req.headers['x-agent-secret'];
+  if (!API_SECRET) {
+    return next(); // secret non configuré → mode ouvert
+  }
+  if (incoming === API_SECRET) {
+    return next();
+  }
+  addLog(`⛔ [AUTH REJET] Requête ${req.method} ${req.url} bloquée (Secret reçu: "${incoming ? 'INVALIDE' : 'ABSENT'}").`);
   res.status(403).json({ error: 'Forbidden — invalid API secret' });
 }
 

@@ -62,18 +62,31 @@ app.use(session({
         maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     },
 }));
+// ── Request Logger & Debug Middleware ───────────────────────────────────────
+app.use((req, _res, next) => {
+    const sid = req.sessionID ? req.sessionID.slice(0, 8) : 'none';
+    const authState = req.session?.authenticated ? '✅ Auth' : '❌ Guest';
+    const proto = req.headers['x-forwarded-proto'] || req.protocol;
+    console.log(`📡 [${req.method}] ${req.url} | Session: ${sid} (${authState}) | Proto: ${proto} | Host: ${req.headers.host || 'unknown'}`);
+    next();
+});
 function requireAuth(req, res, next) {
-    if (req.session.authenticated)
+    if (req.session?.authenticated)
         return next();
+    console.log(`⛔ [API 401] ${req.method} ${req.url} -> Accès refusé (non authentifié)`);
     res.status(401).json({ error: 'Unauthorized' });
 }
 function requireAuthPage(req, res, next) {
-    if (req.session.authenticated)
+    if (req.session?.authenticated)
         return next();
+    console.log(`🛑 [AUTH] Redirection vers /login pour ${req.url} (Pas de session active)`);
     res.redirect('/login');
 }
 // ── Proxy helper ─────────────────────────────────────────────────────────────
 async function proxyToAgent(method, agentPath, body) {
+    const target = `${PC_AGENT_URL}${agentPath}`;
+    const start = Date.now();
+    console.log(`➡️  [PROXY ${method}] Envoi vers PC Agent : ${target}`);
     const headers = {
         'Content-Type': 'application/json',
     };
@@ -86,10 +99,20 @@ async function proxyToAgent(method, agentPath, body) {
     if (body !== undefined) {
         fetchOptions.body = JSON.stringify(body);
     }
-    const res = await fetch(`${PC_AGENT_URL}${agentPath}`, fetchOptions);
-    const contentType = res.headers.get('content-type') || 'application/octet-stream';
-    const data = Buffer.from(await res.arrayBuffer());
-    return { status: res.status, contentType, data };
+    try {
+        const res = await fetch(target, fetchOptions);
+        const ms = Date.now() - start;
+        console.log(`⬅️  [PROXY ${method}] Réponse reçue de ${agentPath} -> HTTP ${res.status} (${ms}ms)`);
+        const contentType = res.headers.get('content-type') || 'application/octet-stream';
+        const data = Buffer.from(await res.arrayBuffer());
+        return { status: res.status, contentType, data };
+    }
+    catch (err) {
+        const ms = Date.now() - start;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`💥 [PROXY ERREUR] Impossible de joindre le PC Agent sur ${target} (${ms}ms) : ${msg}`);
+        throw err;
+    }
 }
 // ── Routes ───────────────────────────────────────────────────────────────────
 // Login page
@@ -150,25 +173,85 @@ app.get('/login', (_req, res) => {
 // Login handler
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
-    if (username === USERNAME && await bcrypt.compare(password, PASS_HASH)) {
+    console.log(`🔐 [POST /login] Tentative de connexion avec l'utilisateur: "${username}"`);
+    if (!username || !password) {
+        console.log(`❌ [LOGIN ÉCHEC] Nom d'utilisateur ou mot de passe manquant dans le corps de requête.`);
+        return res.redirect('/login?error=1');
+    }
+    const userMatches = username.trim().toLowerCase() === USERNAME.trim().toLowerCase();
+    const passMatches = await bcrypt.compare(password, PASS_HASH);
+    console.log(`🔍 [LOGIN VÉRIF] Utilisateur: ${userMatches ? '✅ OUI' : '❌ NON'} | Mot de passe: ${passMatches ? '✅ OUI' : '❌ NON'}`);
+    if (userMatches && passMatches) {
         req.session.authenticated = true;
         req.session.save((err) => {
-            if (err)
-                console.error('Session save error:', err);
+            if (err) {
+                console.error(`💥 [SESSION ERREUR] Erreur de sauvegarde:`, err);
+                return res.redirect('/login?error=save');
+            }
+            console.log(`🎉 [LOGIN SUCCÈS] Session activée (ID: ${req.sessionID}) -> Redirection vers /`);
             res.redirect('/');
         });
     }
     else {
+        console.log(`❌ [LOGIN REJETÉ] Identifiants invalides.`);
         res.redirect('/login?error=1');
     }
 });
 // Logout
 app.post('/logout', (req, res) => {
+    console.log(`👋 [LOGOUT] Déconnexion de l'utilisateur (Session: ${req.sessionID})`);
     req.session.destroy(() => res.redirect('/login'));
 });
 // Dashboard (self-contained SPA)
-app.get('/', requireAuthPage, (_req, res) => {
+app.get('/', requireAuthPage, (req, res) => {
+    console.log(`🏠 [GET /] Affichage du dashboard pour l'utilisateur authentifié (Session: ${req.sessionID})`);
     res.sendFile(resolveDashboardPath());
+});
+// ── Diagnostic / Health Check (accessible sans auth pour tester la jonction) ──
+app.get('/api/health', async (_req, res) => {
+    console.log(`🩺 [HEALTH CHECK] Test de diagnostic demandé`);
+    const start = Date.now();
+    let pcAgentCheck = {};
+    try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (API_SECRET)
+            headers['X-Agent-Secret'] = API_SECRET;
+        const response = await fetch(`${PC_AGENT_URL}/status`, { headers });
+        const ms = Date.now() - start;
+        const bodyText = await response.text();
+        let jsonBody = null;
+        try {
+            jsonBody = JSON.parse(bodyText);
+        }
+        catch { /* ignore */ }
+        pcAgentCheck = {
+            reachable: true,
+            status_code: response.status,
+            latency_ms: ms,
+            response: jsonBody || bodyText.slice(0, 200),
+        };
+    }
+    catch (err) {
+        const ms = Date.now() - start;
+        const msg = err instanceof Error ? err.message : String(err);
+        pcAgentCheck = {
+            reachable: false,
+            latency_ms: ms,
+            error: msg,
+            hint: "Vérifiez que WireGuard est actif (10.7.0.1 <-> 10.7.0.2) et que 'npx tsx agent.ts' tourne sur le PC Windows.",
+        };
+    }
+    res.json({
+        gateway: {
+            status: 'online',
+            port: PORT,
+            configured_user: USERNAME,
+            configured_target: PC_AGENT_URL,
+            pass_hash_set: Boolean(PASS_HASH),
+            api_secret_set: Boolean(API_SECRET),
+        },
+        pc_agent_link: pcAgentCheck,
+    });
 });
 // ── Authenticated API proxy routes ───────────────────────────────────────────
 app.get('/api/status', requireAuth, async (_req, res) => {
