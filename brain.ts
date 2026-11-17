@@ -57,8 +57,8 @@ export async function askPlanner(
 Tu ne cliques pas toi-même : tu réfléchis, tu analyses et tu diriges un modèle EXÉCUTANT (UI-TARS) spécialisé dans le clic GUI.
 
 CATALOGUE COMPLET DES OUTILS POUR L'EXÉCUTANT :
+- "OpenUrlInChrome" : Ouvre directement une URL (ex: "https://sheets.new" pour Google Sheets, "https://docs.new" pour Docs, "https://web.whatsapp.com", etc.) dans Chrome.
 - "ComposeGmail" : Ouvre directement la rédaction d'un email Gmail pré-rempli (to, subject, body) et envoie Ctrl+Entrée.
-- "OpenUrlInChrome" : Ouvre directement une URL (WhatsApp, Drive, YouTube...) dans Google Chrome.
 - "Click" : Clique sur un numéro de "label" exact listé dans "Interactive Elements" du Snapshot.
 - "ClickPerMille" : Clique aux coordonnées (x_permille, y_permille) de 0 à 1000‰ sur l'image.
 - "TypeRaw" : Colle/tape du texte instantanément au clavier (+ press_enter / press_tab).
@@ -68,28 +68,29 @@ CATALOGUE COMPLET DES OUTILS POUR L'EXÉCUTANT :
 - "PowerShell" : Exécute une commande système Windows.
 - "RecallPastConversation" : Consulte les archives (conversation.txt / execution.log) des sessions passées pour se souvenir d'une information.
 
-RÈGLES STRATÉGIQUES D'OPTIMISATION DE TEMPS :
-CONSIGNE DE CONCISITÉ ABSOLUE : Tu es un routeur stratégique rapide, PAS un rédacteur. Ne fais AUCUN long monologue intérieur. Réponds immédiatement un JSON compact.
-1. Si l'ordre de Grégoire est une simple question, une salutation ou ne nécessite aucune manipulation du PC :
-   Réponds directement en 1 ou 2 phrases courtes :
-   {"status": "DONE", "thought": "Réponse directe concise.", "final_response": "Ta réponse courte"}
-2. Si tu as absolument besoin de voir visuellement l'écran pour comprendre ou trouver un élément graphique :
-   Réponds :
+RÈGLES STRATÉGIQUES ESSENTIELLES :
+1. NAVIGATION WEB & SERVICES GOOGLE (Google Sheets, Docs, YouTube, etc.) :
+   Ne cherche JAMAIS à cliquer sur la barre des tâches ou sur l'icône Chrome !
+   Utilise IMMÉDIATEMENT "OpenUrlInChrome" avec l'URL directe :
+   - Pour Google Sheets : subtask_instruction="Ouvre https://sheets.new dans Chrome", allowed_tools=["OpenUrlInChrome"], max_steps=1
+   - Pour Google Docs : subtask_instruction="Ouvre https://docs.new dans Chrome", allowed_tools=["OpenUrlInChrome"], max_steps=1
+   - Pour tout site : donne l'URL directe avec "OpenUrlInChrome".
+2. SAISIE DE TEXTE :
+   Dès que le document ou le champ est ouvert et actif, donne l'instruction à l'Exécutant de saisir le texte avec "TypeRaw" (avec press_enter=true).
+3. QUESTION SIMPLE OU SALUTATION :
+   Si Grégoire pose une question ou salue sans manipulation requise, réponds directement :
+   {"status": "DONE", "thought": "Réponse directe.", "final_response": "Ta réponse"}
+4. INSPECTION D'ÉCRAN :
+   Si tu as besoin de voir l'écran pour localiser un élément graphique :
    {"status": "NEED_SNAPSHOT", "thought": "Capture requise"}
-3. Si l'action peut être exécutée directement par un outil (ex: OpenUrlInChrome, ComposeGmail, PowerShell, App) sans avoir besoin de capture visuelle préalable :
-   Donne immédiatement la sous-tâche :
-   {"status": "CONTINUE", "subtask_instruction": "...", "allowed_tools": ["..."], "max_steps": 1}
-4. Si l'objectif global est déjà accompli :
-   Réponds :
-   {"status": "DONE", "thought": "Terminé.", "final_response": "..."}
 
 Format JSON STRICT (sans texte autour) :
 {
   "status": "CONTINUE" | "DONE" | "FAILED" | "NEED_SNAPSHOT",
-  "thought": "Ton analyse stratégique",
+  "thought": "Ton analyse stratégique concise",
   "subtask_instruction": "Consigne précise pour l'Exécutant si status=CONTINUE",
-  "allowed_tools": ["Outil1"],
-  "max_steps": 4,
+  "allowed_tools": ["OpenUrlInChrome"],
+  "max_steps": 2,
   "final_response": "Réponse finale pour Grégoire si status est DONE ou FAILED"
 }`;
 
@@ -128,7 +129,7 @@ Format JSON STRICT (sans texte autour) :
   const response = await llm.chat.completions.create({
     model: plannerModelId,
     temperature: 0.1,
-    max_tokens: 300,
+    max_tokens: 500,
     messages: [
       { role: 'system', content: systemPrompt },
       {
@@ -141,11 +142,20 @@ Format JSON STRICT (sans texte autour) :
   const choice = response.choices[0];
   const rawText = choice?.message?.content || '{}';
   const cleaned = rawText.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
 
-  if (jsonMatch) {
+  // Extraction JSON tolérante (code blocks ```json ... ``` ou accolades { ... })
+  let jsonString = '';
+  const codeBlockMatch = cleaned.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+  if (codeBlockMatch && codeBlockMatch[1]) {
+    jsonString = codeBlockMatch[1];
+  } else {
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (jsonMatch) jsonString = jsonMatch[0];
+  }
+
+  if (jsonString) {
     try {
-      const parsed = JSON.parse(jsonMatch[0]) as Partial<PlannerDecision>;
+      const parsed = JSON.parse(jsonString) as Partial<PlannerDecision>;
       const validTools =
         Array.isArray(parsed.allowed_tools) && parsed.allowed_tools.length > 0
           ? parsed.allowed_tools
@@ -160,13 +170,25 @@ Format JSON STRICT (sans texte autour) :
         final_response: parsed.final_response,
       };
     } catch {
-      // Fallback si JSON mal formé
+      // Fallback si JSON syntaxiquement incomplet
     }
+  }
+
+  // Détection intelligente si le modèle a suggéré une URL directe dans son texte libre
+  const directUrl = cleaned.match(/https?:\/\/[^\s"'`)]+/i);
+  if (directUrl) {
+    return {
+      status: 'CONTINUE',
+      thought: `Navigation web vers ${directUrl[0]} requise.`,
+      subtask_instruction: `Ouvre la page ${directUrl[0]} dans Google Chrome`,
+      allowed_tools: ['OpenUrlInChrome'],
+      max_steps: 1,
+    };
   }
 
   return {
     status: 'CONTINUE',
-    thought: 'Plan par défaut (JSON non détecté).',
+    thought: 'Plan par défaut (continuation).',
     subtask_instruction: userGoal,
     allowed_tools: allToolNames,
     max_steps: 5,
@@ -241,6 +263,54 @@ RÈGLES D'EXÉCUTION :
 
     if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
       const text = (assistantMessage.content || '').trim();
+
+      // Cas 1 : Coordonnées de clic brutes émises par UI-TARS (ex: "(286,872)" ou "(286, 872)" ou "click(point=[286, 872])")
+      const coordMatch =
+        text.match(/^\(?\s*(\d{1,4})\s*,\s*(\d{1,4})\s*\)?$/) ||
+        text.match(/(?:click|point|loc)\s*=?\s*\[?\s*(\d{1,4})\s*,\s*(\d{1,4})\s*\]?/i) ||
+        text.match(/(\d{1,4})\s*,\s*(\d{1,4})/);
+
+      if (coordMatch && !text.includes('[SOUS-TÂCHE TERMINÉE]')) {
+        const x = parseInt(coordMatch[1]!, 10);
+        const y = parseInt(coordMatch[2]!, 10);
+        if (x <= state.screenDimensions.width + 100 && y <= state.screenDimensions.height + 100) {
+          addLog(`🎯 [Auto-Parse UI-TARS] Coordonnées de clic détectées : (${x}, ${y}) -> Exécution du clic`);
+          try {
+            await mcpClient.callTool({
+              name: 'Click',
+              arguments: { loc: [x, y] },
+            });
+            await sleep(1500);
+            currentSnap = await takeFreshSnapshot();
+            actionsLog.push(`Exécuté : Clic(${x}, ${y})`);
+            messages.push({
+              role: 'user',
+              content: `Clic effectué aux coordonnées (${x}, ${y}). Nouvel état de l'écran :\n${currentSnap.text}`,
+            });
+            continue; // Le clic a été effectué, on poursuit la sous-tâche !
+          } catch (e) {
+            addLog(`❌ Erreur lors du clic auto-parsé : ${e}`);
+          }
+        }
+      }
+
+      // Cas 2 : Ordre d'ouverture d'URL directe
+      const urlMatch = text.match(/https?:\/\/[^\s"'`)]+/i);
+      if (urlMatch && /ouvr|open|navig|va sur|sheets|docs/i.test(text)) {
+        const url = urlMatch[0];
+        addLog(`🌐 [Auto-Parse UI-TARS] Ordre d'ouverture d'URL détecté : "${url}"`);
+        openUrlInChrome(url);
+        await sleep(3500);
+        currentSnap = await takeFreshSnapshot();
+        actionsLog.push(`Exécuté : OpenUrlInChrome("${url}")`);
+        messages.push({
+          role: 'user',
+          content: `Page "${url}" ouverte dans Google Chrome. Nouvel état de l'écran :\n${currentSnap.text}`,
+        });
+        continue;
+      }
+
+      // Cas 3 : Fin normale de sous-tâche
       addLog(`🛠️ [Exécutant -> Stratège] Fin de sous-tâche : ${text.split('\n')[0]}`);
       actionsLog.push(`Note Exécutant : ${text}`);
       break;
