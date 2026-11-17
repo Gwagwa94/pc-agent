@@ -107,7 +107,10 @@ async function proxyToAgent(
 ): Promise<{ status: number; contentType: string; data: Buffer }> {
   const target = `${PC_AGENT_URL}${agentPath}`;
   const start = Date.now();
-  console.log(`➡️  [PROXY ${method}] Envoi vers PC Agent : ${target}`);
+  const isStatusPing = agentPath.startsWith('/status');
+  if (!isStatusPing) {
+    console.log(`➡️  [PROXY ${method}] Envoi vers PC Agent : ${target}`);
+  }
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -125,7 +128,9 @@ async function proxyToAgent(
   try {
     const res = await fetch(target, fetchOptions as Parameters<typeof fetch>[1]);
     const ms = Date.now() - start;
-    console.log(`⬅️  [PROXY ${method}] Réponse reçue de ${agentPath} -> HTTP ${res.status} (${ms}ms)`);
+    if (!isStatusPing) {
+      console.log(`⬅️  [PROXY ${method}] Réponse reçue de ${agentPath} -> HTTP ${res.status} (${ms}ms)`);
+    }
 
     const contentType = res.headers.get('content-type') || 'application/octet-stream';
     const data = Buffer.from(await res.arrayBuffer());
@@ -297,6 +302,24 @@ app.get('/api/status', requireAuth, async (_req, res) => {
 app.get('/api/snapshot.png', requireAuth, async (_req, res) => {
   try {
     const { status, contentType, data } = await proxyToAgent('GET', '/snapshot.png');
+    res.status(status).type(contentType).send(data);
+  } catch (err) {
+    res.status(502).json({ error: 'PC agent unreachable', detail: String(err) });
+  }
+});
+
+app.get('/api/models', requireAuth, async (_req, res) => {
+  try {
+    const { status, contentType, data } = await proxyToAgent('GET', '/models');
+    res.status(status).type(contentType).send(data);
+  } catch (err) {
+    res.status(502).json({ error: 'PC agent unreachable', detail: String(err) });
+  }
+});
+
+app.post('/api/model', requireAuth, async (req, res) => {
+  try {
+    const { status, contentType, data } = await proxyToAgent('POST', '/model', req.body);
     res.status(status).type(contentType).send(data);
   } catch (err) {
     res.status(502).json({ error: 'PC agent unreachable', detail: String(err) });

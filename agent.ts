@@ -9,7 +9,13 @@ import { addLog } from './logger.js';
 import { initScreenResolution } from './powershell.js';
 import { initMCP } from './mcp.js';
 import { runAgentTask } from './brain.js';
-import { syncLoadedModelAtStartup } from './vram.js';
+import {
+  syncLoadedModelAtStartup,
+  PLANNER_MODEL,
+  EXECUTOR_MODEL,
+  setPlannerModel,
+  getAvailableLlmModels,
+} from './vram.js';
 
 dotenv.config();
 
@@ -27,6 +33,10 @@ app.use((req, res, next) => {
 
 // ── Middleware de log des requêtes entrantes ─────────────────────────────────
 app.use((req, _res, next) => {
+  // Ne pas polluer les logs avec les pings /status répétitifs si la connexion est active
+  if (req.url === '/status' || req.url.startsWith('/status?')) {
+    return next();
+  }
   addLog(`🌐 [AGENT HTTP ${req.method}] ${req.url} depuis ${req.ip}`);
   next();
 });
@@ -81,6 +91,23 @@ app.get('/snapshot.png', requireSecret, (_req, res) => {
   } else {
     res.status(404).end();
   }
+});
+
+app.get('/models', requireSecret, (_req, res) => {
+  res.json({
+    currentPlanner: PLANNER_MODEL,
+    currentExecutor: EXECUTOR_MODEL,
+    models: getAvailableLlmModels(),
+  });
+});
+
+app.post('/model', requireSecret, (req, res) => {
+  const { plannerModel } = req.body;
+  if (!plannerModel || typeof plannerModel !== 'string') {
+    return res.status(400).json({ error: 'Paramètre "plannerModel" manquant' });
+  }
+  setPlannerModel(plannerModel);
+  res.json({ status: 'ok', currentPlanner: PLANNER_MODEL });
 });
 
 app.post('/command', requireSecret, async (req, res) => {

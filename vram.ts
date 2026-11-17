@@ -5,10 +5,47 @@ import OpenAI from 'openai';
 import { addLog, sleep } from './logger.js';
 import { state } from './state.js';
 
-export let PLANNER_MODEL = process.env.PLANNER_MODEL || 'gemma-4-26b-a4b';
+export let PLANNER_MODEL = process.env.PLANNER_MODEL || 'ui-tars-1.5-7b';
 export let EXECUTOR_MODEL = process.env.EXECUTOR_MODEL || 'ui-tars-1.5-7b';
-export let PLANNER_CONTEXT_LENGTH = process.env.PLANNER_CONTEXT_LENGTH || '32768';
+export let PLANNER_CONTEXT_LENGTH = process.env.PLANNER_CONTEXT_LENGTH || '16384';
 export let EXECUTOR_CONTEXT_LENGTH = process.env.EXECUTOR_CONTEXT_LENGTH || '16384';
+
+export function setPlannerModel(modelKey: string): void {
+  PLANNER_MODEL = modelKey;
+  // Ajustement dynamique de la longueur de contexte selon le modèle choisi
+  if (/26b|27b|30b|a4b|a3b/i.test(modelKey)) {
+    PLANNER_CONTEXT_LENGTH = '32768';
+  } else {
+    PLANNER_CONTEXT_LENGTH = '16384';
+  }
+  addLog(`⚙️ [MODÈLE STRATÈGE MIS À JOUR] Actif : "${PLANNER_MODEL}" (Contexte : ${PLANNER_CONTEXT_LENGTH} tokens)`);
+}
+
+export function getAvailableLlmModels(): Array<{ id: string; name: string }> {
+  try {
+    const lmsCmd = resolveLmsCliPath();
+    const stdout = execSync(`${lmsCmd} ls --json`, { stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000 }).toString();
+    const data = JSON.parse(stdout);
+    if (Array.isArray(data)) {
+      const list = data
+        .filter((m: any) => m.type === 'llm' && m.architecture !== 'flux')
+        .map((m: any) => ({
+          id: (m.modelKey || m.indexedModelIdentifier || m.displayName || '') as string,
+          name: (m.displayName || m.modelKey || '') as string,
+        }))
+        .filter((m) => Boolean(m.id));
+      if (list.length > 0) return list;
+    }
+  } catch {
+    // fallback
+  }
+  return [
+    { id: 'ui-tars-1.5-7b', name: 'UI TARS 1.5 7B (100% VRAM / 0 Swap)' },
+    { id: 'qwen/qwen3.5-9b', name: 'Qwen 3.5 9B (100% VRAM)' },
+    { id: 'qwen3.5-9b-claude-4.6-highiq-instruct-heretic-uncensored', name: 'Qwen 3.5 9B Claude (100% VRAM)' },
+    { id: 'google/gemma-4-26b-a4b-qat', name: 'Gemma 4 26B A4B QAT (MoE Hybride)' },
+  ];
+}
 
 export function resolveLmsCliPath(): string {
   const userProfile = process.env.USERPROFILE || 'C:\\Users\\grego';

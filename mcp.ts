@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import sharp from 'sharp';
 import OpenAI from 'openai';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -66,12 +67,29 @@ export async function takeFreshSnapshot(): Promise<SnapResult> {
           state.screenDimensions = { width: pngW, height: pngH };
         }
       }
+      // Sauvegarde du snapshot haute résolution (FHD) pour affichage net dans le dashboard
       fs.writeFileSync(path.join(process.cwd(), 'last_snapshot.png'), imgBuffer);
       state.lastSnapshotTimestamp = Date.now();
+
+      // Redimensionnement en 720p (1280x720) pour alléger les tokens visuels du VLM de plus de 55%
+      let base64ToSend = item.data;
+      try {
+        const resized = await sharp(imgBuffer)
+          .resize({ width: 1280, height: 720, fit: 'inside' })
+          .png({ quality: 80, compressionLevel: 6 })
+          .toBuffer();
+        base64ToSend = resized.toString('base64');
+        addLog(
+          `📸 [720p OPTIMISÉ] Image redimensionnée pour le VLM (${Math.round(resized.length / 1024)} Ko vs ${Math.round(imgBuffer.length / 1024)} Ko en FHD)`
+        );
+      } catch (err) {
+        // En cas d'erreur de redimensionnement, on utilise l'original sans bloquer
+      }
+
       images.push({
         type: 'image_url',
         image_url: {
-          url: `data:${item.mimeType || 'image/png'};base64,${item.data}`,
+          url: `data:image/png;base64,${base64ToSend}`,
         },
       });
     }
