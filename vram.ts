@@ -63,7 +63,7 @@ export async function swapVramModel(
     execSync(`${lmsCmd} unload --all`, { stdio: 'ignore', timeout: 20000 });
     await sleep(400);
 
-    execSync(`${lmsCmd} load "${targetModelKey}" ${gpuFlag} ${contextFlag} -y`, {
+    execSync(`${lmsCmd} load "${targetModelKey}" ${gpuFlag} ${contextFlag} --parallel 1 -y`, {
       stdio: 'ignore',
       timeout: 90000,
     });
