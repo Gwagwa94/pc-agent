@@ -7,8 +7,22 @@ export function openUrlInChrome(url: string): void {
   }
   const base64Url = Buffer.from(cleanUrl, 'utf8').toString('base64');
   const psScript = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32ChromeFocus {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
 $u = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${base64Url}'))
 Start-Process "chrome.exe" -ArgumentList $u
+Start-Sleep -Milliseconds 600
+$chrome = Get-Process -Name "chrome" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+if ($chrome) {
+  [void][Win32ChromeFocus]::ShowWindow($chrome.MainWindowHandle, 9)
+  [void][Win32ChromeFocus]::SetForegroundWindow($chrome.MainWindowHandle)
+}
 `;
   runPowerShellSafe(psScript);
 }

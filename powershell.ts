@@ -46,3 +46,33 @@ export function initScreenResolution(): void {
     addLog(`🖥️ Résolution par défaut utilisée : ${state.screenDimensions.width}x${state.screenDimensions.height}`);
   }
 }
+
+export function focusWindow(windowHandle: number | string): boolean {
+  try {
+    const handleNum = typeof windowHandle === 'number' ? windowHandle : parseInt(String(windowHandle), 10);
+    if (!handleNum || isNaN(handleNum)) return false;
+    runPowerShellSafe(`
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Switch {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+}
+"@
+$h = [IntPtr]${handleNum}
+if ([Win32Switch]::IsIconic($h)) {
+  [void][Win32Switch]::ShowWindow($h, 9)
+} else {
+  [void][Win32Switch]::ShowWindow($h, 5)
+}
+[void][Win32Switch]::SetForegroundWindow($h)
+`);
+    addLog(`🪟 [Win32] Fenêtre (handle ${handleNum}) activée au premier plan`);
+    return true;
+  } catch (err) {
+    addLog(`⚠️ Échec de l'activation de la fenêtre handle ${windowHandle}: ${err}`);
+    return false;
+  }
+}

@@ -20,6 +20,7 @@ build/
 *.sqlite3
 *.db
 sessions/
+conversations/
 
 # Captures d'écran temporaires générées par l'agent
 last_snapshot.png

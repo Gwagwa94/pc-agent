@@ -7,7 +7,7 @@ import { openUrlInChrome, typeTextViaClipboard, sendKeyShortcutReliable } from '
 import { askGeminiWeb } from './gemini.js';
 import fs from 'fs';
 import path from 'path';
-import { getForegroundWindowTitle } from './powershell.js';
+import { getForegroundWindowTitle, focusWindow } from './powershell.js';
 import type { PlannerDecision, SnapResult } from './types.js';
 import {
   getConversation,
@@ -40,6 +40,261 @@ function isSimpleGreeting(text: string): string | null {
   return null;
 }
 
+function cleanJsonString(raw: string): string {
+  let inStr = false;
+  let esc = false;
+  let res = '';
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (inStr) {
+      if (esc) {
+        esc = false;
+        res += c;
+      } else if (c === '\\') {
+        esc = true;
+        res += c;
+      } else if (c === '"') {
+        inStr = false;
+        res += c;
+      } else if (c === '\n') {
+        res += '\\n';
+      } else if (c === '\r') {
+        res += '\\r';
+      } else if (c === '\t') {
+        res += '\\t';
+      } else {
+        res += c;
+      }
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      res += c;
+      continue;
+    }
+    res += c;
+  }
+  return res;
+}
+
+interface ParsedActionCall {
+  name: string;
+  args: Record<string, unknown>;
+  isNative: boolean;
+  id?: string;
+}
+
+function extractToolCallsFromContent(text: string): ParsedActionCall[] {
+  const tools: ParsedActionCall[] = [];
+  if (!text) return tools;
+
+  // 1. Détection de tous les objets JSON balancés {...} contenant name / action / tool
+  let depth = 0;
+  let startIdx = -1;
+  let inString = false;
+  let escapeNext = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escapeNext) {
+        escapeNext = false;
+      } else if (char === '\\') {
+        escapeNext = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') {
+      if (depth === 0) startIdx = i;
+      depth++;
+    } else if (char === '}') {
+      depth--;
+      if (depth === 0 && startIdx !== -1) {
+        const candidate = text.slice(startIdx, i + 1);
+        try {
+          const sanitized = cleanJsonString(candidate);
+          const obj = JSON.parse(sanitized);
+          const toolName = obj.name || obj.action || obj.tool || obj.function;
+          if (toolName && typeof toolName === 'string') {
+            const rawArgs = obj.arguments ?? obj.args ?? obj.parameters ?? {};
+            const args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
+            tools.push({
+              name: toolName,
+              args: typeof args === 'object' && args !== null ? args : { value: args },
+              isNative: false,
+            });
+          }
+        } catch {
+          // ignore
+        }
+        startIdx = -1;
+      }
+    }
+  }
+
+  if (tools.length > 0) return tools;
+
+  // 2. Syntaxe standard UI-TARS Action:
+  const clickMatch = text.match(/(?:click|point|loc)\s*(?:=|:|\()\s*\[?\s*(\d{1,4})\s*,\s*(\d{1,4})/i);
+  if (clickMatch && !text.includes('[SOUS-TÂCHE TERMINÉE]')) {
+    const x = parseInt(clickMatch[1]!, 10);
+    const y = parseInt(clickMatch[2]!, 10);
+    if (x <= state.screenDimensions.width + 100 && y <= state.screenDimensions.height + 100) {
+      tools.push({ name: 'Click', args: { loc: [x, y] }, isNative: false });
+      return tools;
+    }
+  }
+
+  const typeMatch = text.match(/(?:type|write|input)\s*(?:\(content=|\(text=|:\s*|=['"])([\s\S]*?)(?:\)|"|'|$)/i);
+  if (typeMatch && typeMatch[1] && !text.includes('[SOUS-TÂCHE TERMINÉE]')) {
+    tools.push({ name: 'TypeRaw', args: { text: typeMatch[1].trim() }, isNative: false });
+    return tools;
+  }
+
+  const keyMatch = text.match(/(?:hotkey|press|shortcut)\s*(?:\(key=|:\s*|=['"])([\w+]+)(?:\)|"|'|$)/i);
+  if (keyMatch && keyMatch[1]) {
+    tools.push({ name: 'Shortcut', args: { shortcut: keyMatch[1].trim() }, isNative: false });
+    return tools;
+  }
+
+  // 3. Coordonnées brutes (ex: "(286, 872)")
+  const rawCoordMatch = text.match(/^\(?\s*(\d{1,4})\s*,\s*(\d{1,4})\s*\)?$/) || text.match(/(\d{1,4})\s*,\s*(\d{1,4})/);
+  if (rawCoordMatch && !text.includes('[SOUS-TÂCHE TERMINÉE]')) {
+    const x = parseInt(rawCoordMatch[1]!, 10);
+    const y = parseInt(rawCoordMatch[2]!, 10);
+    if (x <= state.screenDimensions.width + 100 && y <= state.screenDimensions.height + 100) {
+      tools.push({ name: 'Click', args: { loc: [x, y] }, isNative: false });
+      return tools;
+    }
+  }
+
+  return tools;
+}
+
+async function executeSingleToolAction(
+  fnName: string,
+  fnArgs: Record<string, unknown>,
+  openedUrls: Set<string>
+): Promise<{ textResult: string; newSnap: SnapResult }> {
+  let textResult = '';
+  let newSnap: SnapResult;
+
+  if (fnName === 'OpenUrlInChrome') {
+    const targetUrl = String(fnArgs.url || '').trim();
+    if (openedUrls.has(targetUrl)) {
+      addLog(`⚠️ [Exécutant] URL "${targetUrl}" déjà ouverte.`);
+      newSnap = await takeFreshSnapshot();
+      textResult = `L'URL "${targetUrl}" est DÉJÀ OUVERTE dans Chrome. Ne la ré-ouvre pas ! Passe immédiatement à l'action suivante : clique dans la zone de texte ou utilise TypeRaw pour saisir le contenu.\n${newSnap.text}`;
+    } else {
+      openedUrls.add(targetUrl);
+      addLog(`🌐 [Exécutant] Ouverture de l'URL "${targetUrl}" dans Chrome...`);
+      openUrlInChrome(targetUrl);
+      await sleep(3500);
+      newSnap = await takeFreshSnapshot();
+      textResult = `URL "${targetUrl}" ouverte dans Google Chrome avec succès.\n${newSnap.text}`;
+    }
+  } else if (fnName === 'App') {
+    const mode = String(fnArgs.mode || 'switch');
+    const handle = fnArgs.window_handle ? Number(fnArgs.window_handle) : undefined;
+    if (mode === 'switch' && handle) {
+      addLog(`🪟 [Exécutant] Bascule vers la fenêtre handle ${handle}...`);
+      focusWindow(handle);
+      try {
+        await mcpClient.callTool({ name: 'App', arguments: fnArgs });
+      } catch (err) {
+        addLog(`ℹ️ MCP App switch: ${err}`);
+      }
+      await sleep(1500);
+      newSnap = await takeFreshSnapshot();
+      textResult = `Bascule vers la fenêtre (handle ${handle}) effectuée. La fenêtre est active au premier plan.\n${newSnap.text}`;
+    } else {
+      const mcpResult = await mcpClient.callTool({ name: 'App', arguments: fnArgs });
+      await sleep(1500);
+      newSnap = await takeFreshSnapshot();
+      textResult = `Application action exécutée : ${JSON.stringify(mcpResult.content || 'OK')}\n${newSnap.text}`;
+    }
+  } else if (fnName === 'TypeRaw') {
+    const textToType = String(fnArgs.text || '');
+    const pressEnter = fnArgs.press_enter === true || fnArgs.press_enter === 'True';
+    const pressTab = fnArgs.press_tab === true || fnArgs.press_tab === 'True';
+    addLog(`⌨️ [Exécutant] Saisie de ${textToType.length} caractères (enter=${pressEnter}, tab=${pressTab})`);
+    typeTextViaClipboard(textToType, pressEnter, pressTab);
+    await sleep(pressEnter ? 1600 : 800);
+    newSnap = await takeFreshSnapshot();
+    textResult = `Texte "${textToType.slice(0, 100)}${textToType.length > 100 ? '...' : ''}" saisi avec succès via le presse-papiers.\n${newSnap.text}`;
+  } else if (fnName === 'ClickPerMille') {
+    const x_raw = Number(fnArgs.x_permille);
+    const y_raw = Number(fnArgs.y_permille);
+    const x_pixel = Math.round((x_raw / 1000) * state.screenDimensions.width);
+    const y_pixel = Math.round((y_raw / 1000) * state.screenDimensions.height);
+    addLog(`🎯 Clic (${x_raw}‰, ${y_raw}‰) -> pixels (${x_pixel}, ${y_pixel})`);
+    await mcpClient.callTool({
+      name: 'Click',
+      arguments: { loc: [x_pixel, y_pixel] },
+    });
+    await sleep(1000);
+    newSnap = await takeFreshSnapshot();
+    textResult = `Clic effectué à (${x_raw}‰, ${y_raw}‰) [pixels ${x_pixel}, ${y_pixel}].\n${newSnap.text}`;
+  } else if (fnName === 'Click') {
+    await mcpClient.callTool({
+      name: 'Click',
+      arguments: fnArgs,
+    });
+    await sleep(1000);
+    newSnap = await takeFreshSnapshot();
+    textResult = `Clic effectué avec arguments ${JSON.stringify(fnArgs)}.\n${newSnap.text}`;
+  } else if (fnName === 'Shortcut') {
+    const sc = String(fnArgs.shortcut || '');
+    if (!sendKeyShortcutReliable(sc)) {
+      await mcpClient.callTool({ name: 'Shortcut', arguments: fnArgs });
+    }
+    await sleep(1000);
+    newSnap = await takeFreshSnapshot();
+    textResult = `Raccourci "${sc}" envoyé.\n${newSnap.text}`;
+  } else if (fnName === 'ComposeGmail') {
+    const to = encodeURIComponent(String(fnArgs.to || ''));
+    const su = encodeURIComponent(String(fnArgs.subject || 'Test'));
+    const body = encodeURIComponent(String(fnArgs.body || ''));
+    const composeUrl = `https://mail.google.com/mail/?view=cm&fs=1&to=${to}&su=${su}&body=${body}`;
+    openUrlInChrome(composeUrl);
+    await sleep(4500);
+    sendKeyShortcutReliable('ctrl+enter');
+    await sleep(1800);
+    newSnap = await takeFreshSnapshot();
+    textResult = `Fenêtre Gmail pré-remplie ouverte et Ctrl+Entrée envoyé.\n${newSnap.text}`;
+  } else if (fnName === 'ask_gemini_web') {
+    const geminiRes = await askGeminiWeb(String(fnArgs.prompt || ''));
+    newSnap = await takeFreshSnapshot();
+    textResult = `Réponse de Gemini Web : ${geminiRes}\n${newSnap.text}`;
+  } else if (fnName === 'RecallPastConversation') {
+    const q = String(fnArgs.query || '');
+    const cId = String(fnArgs.conversationId || '');
+    const t = fnArgs.fileType === 'log' ? 'log' : 'chat';
+    if (cId) {
+      textResult = readPastConversationDetails(cId, t);
+    } else {
+      textResult = searchPastConversations(q);
+    }
+    newSnap = await takeFreshSnapshot();
+  } else {
+    const mcpResult = await mcpClient.callTool({
+      name: fnName,
+      arguments: fnArgs,
+    });
+    await sleep(900);
+    newSnap = await takeFreshSnapshot();
+    textResult = `${JSON.stringify(mcpResult.content || 'OK')}\n${newSnap.text}`;
+  }
+
+  return { textResult, newSnap };
+}
+
 export async function askPlanner(
   llm: OpenAI,
   userGoal: string,
@@ -59,37 +314,35 @@ Tu ne cliques pas toi-même : tu réfléchis, tu analyses et tu diriges un modè
 CATALOGUE COMPLET DES OUTILS POUR L'EXÉCUTANT :
 - "OpenUrlInChrome" : Ouvre directement une URL (ex: "https://sheets.new" pour Google Sheets, "https://docs.new" pour Docs, "https://web.whatsapp.com", etc.) dans Chrome.
 - "ComposeGmail" : Ouvre directement la rédaction d'un email Gmail pré-rempli (to, subject, body) et envoie Ctrl+Entrée.
-- "Click" : Clique sur un numéro de "label" exact listé dans "Interactive Elements" du Snapshot.
+- "Click" : Clique sur un numéro de "label" exact listé dans "Interactive Elements" du Snapshot ou sur des coordonnées pixels {"loc": [x, y]}.
 - "ClickPerMille" : Clique aux coordonnées (x_permille, y_permille) de 0 à 1000‰ sur l'image.
 - "TypeRaw" : Colle/tape du texte instantanément au clavier (+ press_enter / press_tab).
 - "Shortcut" : Envoie un raccourci clavier (ex: "ctrl+w", "ctrl+enter", "enter", "esc").
 - "Scroll" : Fait défiler la page.
-- "App" : Lance ou bascule vers une application Windows hors navigateur.
+- "App" : Lance ou bascule vers une application Windows existante ({"mode": "switch", "window_handle": <handle>}).
 - "PowerShell" : Exécute une commande système Windows.
-- "RecallPastConversation" : Consulte les archives (conversation.txt / execution.log) des sessions passées pour se souvenir d'une information.
+- "RecallPastConversation" : Consulte les archives (conversation.txt / execution.log) des sessions passées.
 
 RÈGLES STRATÉGIQUES ESSENTIELLES :
-1. STRATÉGIE DE PROGRAMMATION PAR BATCH (ANTI-SWAP VRAM) :
-   Pour éviter des allers-retours de swap VRAM inutiles, ne découpe pas une tâche logique en micro-étapes isolées !
-   Donne à l'Exécutant une séquence d'actions complète dans "subtask_instruction" qu'il exécutera en une seule session (fixe max_steps entre 4 et 8) :
+1. PROGRAMMATION PAR BATCH & ENCHAÎNEMENT D'ÉTAPES (ANTI-SWAP VRAM) :
+   Pour éviter des allers-retours de swap VRAM inutiles, ne découpe JAMAIS une tâche logique en micro-cycles séparés !
+   Donne à l'Exécutant une séquence d'actions complète dans "subtask_instruction" qu'il déroulera d'un trait (fixe max_steps entre 4 et 8) :
    Exemple :
-   "1. Ouvre 'https://sheets.new' avec OpenUrlInChrome.
-   2. Clique sur la première cellule ou zone de saisie.
-   3. Tape le titre et le contenu via TypeRaw ligne par ligne."
-   Allowed tools: ["OpenUrlInChrome", "Click", "ClickPerMille", "TypeRaw", "Shortcut"]
+   "1. Ouvre 'https://docs.new' avec OpenUrlInChrome.
+   2. Utilise TypeRaw pour taper le document : 'Recette Fondant au Chocolat...'.
+   3. Réponds [SOUS-TÂCHE TERMINÉE] dès que le texte est dans le document."
+   Allowed tools: ["OpenUrlInChrome", "App", "TypeRaw", "Click", "Shortcut"]
    Max steps: 6
-   De cette façon, l'Exécutant déroule toute la séquence d'une traite en VRAM sans swap intermédiaire !
 
-2. NAVIGATION WEB & SERVICES GOOGLE (Google Sheets, Docs, YouTube, etc.) :
+2. NAVIGATION WEB & SERVICES GOOGLE :
    Ne cherche JAMAIS à cliquer sur la barre des tâches ou sur l'icône Chrome !
    Utilise IMMÉDIATEMENT "OpenUrlInChrome" avec l'URL directe :
-   - Pour Google Sheets : subtask_instruction="1. Ouvre https://sheets.new dans Chrome. 2. Tape la recette dans les cellules...", allowed_tools=["OpenUrlInChrome", "Click", "ClickPerMille", "TypeRaw"], max_steps=5
-   - Pour Google Docs : subtask_instruction="1. Ouvre https://docs.new dans Chrome. 2. Tape le document...", allowed_tools=["OpenUrlInChrome", "TypeRaw"], max_steps=4
+   - Pour Google Docs : subtask_instruction="1. Ouvre https://docs.new dans Chrome. 2. Utilise TypeRaw pour coller le contenu : 'Recette de Fondant au Chocolat...'", allowed_tools=["OpenUrlInChrome", "App", "TypeRaw"], max_steps=6
+   - Pour Google Sheets : subtask_instruction="1. Ouvre https://sheets.new dans Chrome. 2. Utilise TypeRaw pour saisir le tableau...", allowed_tools=["OpenUrlInChrome", "App", "Click", "TypeRaw"], max_steps=6
    - Pour tout site : donne l'URL directe avec "OpenUrlInChrome".
 
-3. GESTION DE TON BUDGET DE SORTIE :
-   - Ton budget de réponse est de 2048 tokens.
-   - Si la tâche nécessite d'écrire un contenu complet (recette, résumé, données), pré-rédige ce contenu directement dans la consigne de TypeRaw pour que l'Exécutant le colle d'un coup dans l'application !
+3. RÉDACTION DE CONTENU (RECETTES, EMAILS, TEXTES) :
+   Si la demande consiste à rédiger un document ou un contenu (ex: recette, lettre, liste), rédige TOUJOURS le texte complet directement à l'intérieur de la consigne subtask_instruction pour que l'Exécutant puisse le coller directement via TypeRaw sans hésiter !
 
 4. QUESTION SIMPLE OU SALUTATION :
    Si Grégoire pose une question ou salue sans manipulation requise, réponds directement :
@@ -104,7 +357,7 @@ Format JSON STRICT (sans texte autour) :
   "status": "CONTINUE" | "DONE" | "FAILED" | "NEED_SNAPSHOT",
   "thought": "Ton analyse stratégique",
   "subtask_instruction": "Séquence complète et ordonnée pour l'Exécutant si status=CONTINUE",
-  "allowed_tools": ["OpenUrlInChrome", "TypeRaw", "ClickPerMille"],
+  "allowed_tools": ["OpenUrlInChrome", "App", "TypeRaw", "Click", "ClickPerMille"],
   "max_steps": 6,
   "final_response": "Réponse finale pour Grégoire si status est DONE ou FAILED"
 }`;
@@ -158,7 +411,7 @@ Format JSON STRICT (sans texte autour) :
   const rawText = choice?.message?.content || '{}';
   const cleaned = rawText.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
-  // Extraction JSON tolérante (code blocks ```json ... ``` ou accolades { ... })
+  // Extraction JSON tolérante avec assainissement des retours à la ligne
   let jsonString = '';
   const codeBlockMatch = cleaned.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
   if (codeBlockMatch && codeBlockMatch[1]) {
@@ -170,7 +423,8 @@ Format JSON STRICT (sans texte autour) :
 
   if (jsonString) {
     try {
-      const parsed = JSON.parse(jsonString) as Partial<PlannerDecision>;
+      const sanitized = cleanJsonString(jsonString);
+      const parsed = JSON.parse(sanitized) as Partial<PlannerDecision>;
       const validTools =
         Array.isArray(parsed.allowed_tools) && parsed.allowed_tools.length > 0
           ? parsed.allowed_tools
@@ -181,23 +435,39 @@ Format JSON STRICT (sans texte autour) :
         thought: parsed.thought || 'Analyse effectuée.',
         subtask_instruction: parsed.subtask_instruction || userGoal,
         allowed_tools: validTools,
-        max_steps: Math.min(Math.max(Number(parsed.max_steps) || 5, 1), 10),
+        max_steps: Math.min(Math.max(Number(parsed.max_steps) || 6, 1), 10),
         final_response: parsed.final_response,
       };
-    } catch {
-      // Fallback si JSON syntaxiquement incomplet
+    } catch (e) {
+      addLog(`⚠️ [Stratège] Échec JSON.parse standard: ${e}. Tentative d'extraction par regex...`);
+      const statusM = cleaned.match(/"status"\s*:\s*"([^"]+)"/i);
+      const thoughtM = cleaned.match(/"thought"\s*:\s*"([\s\S]*?)"(?:\s*,|\s*\})/i);
+      const subtaskM = cleaned.match(/"subtask_instruction"\s*:\s*"([\s\S]*?)"(?:\s*,|\s*"(?:allowed_tools|max_steps|final_response)")/i);
+      const stepsM = cleaned.match(/"max_steps"\s*:\s*(\d+)/i);
+      const finalResM = cleaned.match(/"final_response"\s*:\s*"([\s\S]*?)"(?:\s*,|\s*\})/i);
+
+      if (statusM || subtaskM) {
+        return {
+          status: (statusM?.[1] as PlannerDecision['status']) || 'CONTINUE',
+          thought: thoughtM?.[1]?.replace(/\\n/g, '\n') || 'Analyse extraite.',
+          subtask_instruction: subtaskM?.[1]?.replace(/\\n/g, '\n') || userGoal,
+          allowed_tools: allToolNames,
+          max_steps: stepsM ? Math.min(Math.max(Number(stepsM[1]), 1), 10) : 6,
+          final_response: finalResM?.[1]?.replace(/\\n/g, '\n'),
+        };
+      }
     }
   }
 
-  // Détection intelligente si le modèle a suggéré une URL directe dans son texte libre
+  // Détection si le modèle a suggéré une URL directe dans son texte libre
   const directUrl = cleaned.match(/https?:\/\/[^\s"'`)]+/i);
   if (directUrl) {
     return {
       status: 'CONTINUE',
       thought: `Navigation web vers ${directUrl[0]} requise.`,
-      subtask_instruction: `Ouvre la page ${directUrl[0]} dans Google Chrome`,
-      allowed_tools: ['OpenUrlInChrome'],
-      max_steps: 1,
+      subtask_instruction: `1. Ouvre la page ${directUrl[0]} dans Google Chrome. 2. Effectue la tâche demandée : ${userGoal}`,
+      allowed_tools: allToolNames,
+      max_steps: 6,
     };
   }
 
@@ -206,7 +476,7 @@ Format JSON STRICT (sans texte autour) :
     thought: 'Plan par défaut (continuation).',
     subtask_instruction: userGoal,
     allowed_tools: allToolNames,
-    max_steps: 5,
+    max_steps: 6,
   };
 }
 
@@ -241,9 +511,11 @@ export async function runExecutorSubtask(
 Ton unique rôle est d'exécuter immédiatement la sous-tâche confiée par le Stratège en appelant les outils mis à ta disposition.
 RÈGLES D'EXÉCUTION :
 1. N'écris pas de long discours : appelle directement l'outil adéquat.
-2. Pour cliquer sur un élément qui possède un numéro de "label" dans "Interactive Elements", utilise "Click" {"label": <numero>}.
-3. Pour cliquer visuellement sur l'image sans label, utilise "ClickPerMille" {"x_permille": <0-1000>, "y_permille": <0-1000>}.
-4. Dès que ta sous-tâche est exécutée, réponds simplement "[SOUS-TÂCHE TERMINÉE]" pour rendre la main au Stratège.`,
+2. Pour taper ou coller du texte, appelle "TypeRaw" {"text": "ton contenu"}.
+3. Pour basculer vers une fenêtre existante, appelle "App" {"mode": "switch", "window_handle": <handle>}.
+4. Pour cliquer sur un élément qui possède un numéro de "label" dans "Interactive Elements", utilise "Click" {"label": <numero>}.
+5. Pour cliquer visuellement sur l'image sans label, utilise "ClickPerMille" {"x_permille": <0-1000>, "y_permille": <0-1000>} ou "Click" {"loc": [x, y]}.
+6. Dès que TOUTE ta sous-tâche est exécutée, réponds simplement "[SOUS-TÂCHE TERMINÉE]" pour rendre la main au Stratège.`,
     },
     {
       role: 'user',
@@ -258,8 +530,10 @@ RÈGLES D'EXÉCUTION :
   ];
 
   const actionsLog: string[] = [];
+  const openedUrlsInSubtask = new Set<string>();
   let currentSnap: SnapResult = { ...initialSnap, fgTitle: '' };
-  let lastToolCallSignature = '';
+  let lastActionSignature = '';
+  let repeatCount = 0;
 
   for (let step = 0; step < maxSteps; step++) {
     pruneOldSnapshots(messages);
@@ -276,198 +550,133 @@ RÈGLES D'EXÉCUTION :
     const assistantMessage = choice.message;
     messages.push(assistantMessage);
 
-    if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
-      const text = (assistantMessage.content || '').trim();
+    const textContent = (assistantMessage.content || '').trim();
 
-      // Cas 1 : Coordonnées de clic brutes émises par UI-TARS (ex: "(286,872)" ou "(286, 872)" ou "click(point=[286, 872])")
-      const coordMatch =
-        text.match(/^\(?\s*(\d{1,4})\s*,\s*(\d{1,4})\s*\)?$/) ||
-        text.match(/(?:click|point|loc)\s*=?\s*\[?\s*(\d{1,4})\s*,\s*(\d{1,4})\s*\]?/i) ||
-        text.match(/(\d{1,4})\s*,\s*(\d{1,4})/);
-
-      if (coordMatch && !text.includes('[SOUS-TÂCHE TERMINÉE]')) {
-        const x = parseInt(coordMatch[1]!, 10);
-        const y = parseInt(coordMatch[2]!, 10);
-        if (x <= state.screenDimensions.width + 100 && y <= state.screenDimensions.height + 100) {
-          addLog(`🎯 [Auto-Parse UI-TARS] Coordonnées de clic détectées : (${x}, ${y}) -> Exécution du clic`);
-          try {
-            await mcpClient.callTool({
-              name: 'Click',
-              arguments: { loc: [x, y] },
-            });
-            await sleep(1500);
-            currentSnap = await takeFreshSnapshot();
-            actionsLog.push(`Exécuté : Clic(${x}, ${y})`);
-            messages.push({
-              role: 'user',
-              content: `Clic effectué aux coordonnées (${x}, ${y}). Nouvel état de l'écran :\n${currentSnap.text}`,
-            });
-            continue; // Le clic a été effectué, on poursuit la sous-tâche !
-          } catch (e) {
-            addLog(`❌ Erreur lors du clic auto-parsé : ${e}`);
-          }
-        }
-      }
-
-      // Cas 2 : Ordre d'ouverture d'URL directe
-      const urlMatch = text.match(/https?:\/\/[^\s"'`)]+/i);
-      if (urlMatch && /ouvr|open|navig|va sur|sheets|docs/i.test(text)) {
-        const url = urlMatch[0];
-        addLog(`🌐 [Auto-Parse UI-TARS] Ordre d'ouverture d'URL détecté : "${url}"`);
-        openUrlInChrome(url);
-        await sleep(3500);
-        currentSnap = await takeFreshSnapshot();
-        actionsLog.push(`Exécuté : OpenUrlInChrome("${url}")`);
-        messages.push({
-          role: 'user',
-          content: `Page "${url}" ouverte dans Google Chrome. Nouvel état de l'écran :\n${currentSnap.text}`,
-        });
-        continue;
-      }
-
-      // Cas 3 : Fin normale de sous-tâche
-      addLog(`🛠️ [Exécutant -> Stratège] Fin de sous-tâche : ${text.split('\n')[0]}`);
-      actionsLog.push(`Note Exécutant : ${text}`);
+    // Vérification explicite de fin de sous-tâche
+    if (
+      textContent.includes('[SOUS-TÂCHE TERMINÉE]') ||
+      textContent.includes('SOUS-TÂCHE TERMINÉE') ||
+      /^terminé[e]?\.?$/i.test(textContent)
+    ) {
+      addLog(`✅ [Exécutant] Fin de sous-tâche confirmée.`);
+      actionsLog.push(`Sous-tâche déclarée terminée avec succès.`);
       break;
     }
 
-    const pendingImages: OpenAI.Chat.Completions.ChatCompletionContentPartImage[] = [];
+    // Extraction des appels d'outils : natifs (tool_calls) OU parsés depuis le texte (ex: .sha {"name": "App", ...})
+    const callsToExecute: ParsedActionCall[] = [];
 
-    for (const toolCall of assistantMessage.tool_calls) {
-      if (toolCall.type !== 'function') continue;
-      const fnName = toolCall.function.name;
-      let fnArgs: Record<string, unknown> = {};
-      try {
-        fnArgs = JSON.parse(toolCall.function.arguments || '{}');
-      } catch {
-        fnArgs = {};
+    if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+      for (const tc of assistantMessage.tool_calls) {
+        if (tc.type !== 'function') continue;
+        let fnArgs: Record<string, unknown> = {};
+        try {
+          fnArgs = JSON.parse(tc.function.arguments || '{}');
+        } catch {
+          fnArgs = {};
+        }
+        callsToExecute.push({
+          name: tc.function.name,
+          args: fnArgs,
+          isNative: true,
+          id: tc.id,
+        });
+      }
+    } else {
+      const parsedFromText = extractToolCallsFromContent(textContent);
+      for (const item of parsedFromText) {
+        callsToExecute.push(item);
       }
 
-      const sig = `${fnName}(${JSON.stringify(fnArgs)})`;
-      if (sig === lastToolCallSignature) {
-        addLog(`⚠️ [Exécutant] Doublon évité sur ${sig}`);
+      if (callsToExecute.length === 0) {
+        const urlMatch = textContent.match(/https?:\/\/[^\s"'`)]+/i);
+        if (urlMatch && /ouvr|open|navig|va sur|sheets|docs/i.test(textContent)) {
+          const url = urlMatch[0];
+          if (!openedUrlsInSubtask.has(url)) {
+            callsToExecute.push({
+              name: 'OpenUrlInChrome',
+              args: { url },
+              isNative: false,
+            });
+          }
+        }
+      }
+    }
+
+    // Si AUCUN outil n'a pu être extrait :
+    if (callsToExecute.length === 0) {
+      if (step === 0 && textContent.length > 0 && !textContent.includes('terminé')) {
+        addLog(`⚠️ [Exécutant] Bavardage sans outil détecté. Nudge vers l'action...`);
         messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: `Action ${sig} déjà effectuée juste avant ! Passe à l'action suivante ou réponds [SOUS-TÂCHE TERMINÉE].`,
+          role: 'user',
+          content: `Ne décris pas l'action en texte : appelle directement l'outil adéquat (ex: TypeRaw pour taper, Click pour cliquer, ou OpenUrlInChrome) pour accomplir la tâche : "${subtaskInstruction}".`,
         });
         continue;
       }
-      lastToolCallSignature = sig;
-
-      addLog(`🛠️ [Exécutant Étape ${step + 1}/${maxSteps}] ${fnName} ${JSON.stringify(fnArgs)}`);
-      let textResult = '';
-
-      try {
-        if (fnName === 'ComposeGmail') {
-          const to = encodeURIComponent(String(fnArgs.to || ''));
-          const su = encodeURIComponent(String(fnArgs.subject || 'Test'));
-          const body = encodeURIComponent(String(fnArgs.body || ''));
-          const composeUrl = `https://mail.google.com/mail/?view=cm&fs=1&to=${to}&su=${su}&body=${body}`;
-
-          openUrlInChrome(composeUrl);
-          await sleep(4500);
-          sendKeyShortcutReliable('ctrl+enter');
-          await sleep(1800);
-
-          currentSnap = await takeFreshSnapshot();
-          pendingImages.push(...currentSnap.images);
-          textResult = `Fenêtre Gmail pré-remplie ouverte et Ctrl+Entrée envoyé.\n${currentSnap.text}`;
-          actionsLog.push(`Exécuté : ComposeGmail vers ${fnArgs.to} (sujet: ${fnArgs.subject})`);
-        } else if (fnName === 'OpenUrlInChrome') {
-          const targetUrl = String(fnArgs.url || '');
-          openUrlInChrome(targetUrl);
-          await sleep(3500);
-          currentSnap = await takeFreshSnapshot();
-          pendingImages.push(...currentSnap.images);
-          textResult = `URL "${targetUrl}" ouverte dans Chrome.\n${currentSnap.text}`;
-          actionsLog.push(`Exécuté : OpenUrlInChrome("${targetUrl}")`);
-        } else if (fnName === 'TypeRaw') {
-          const textToType = String(fnArgs.text || '');
-          const pressEnter = fnArgs.press_enter === true || fnArgs.press_enter === 'True';
-          const pressTab = fnArgs.press_tab === true || fnArgs.press_tab === 'True';
-
-          typeTextViaClipboard(textToType, pressEnter, pressTab);
-          await sleep(pressEnter ? 1600 : 700);
-          currentSnap = await takeFreshSnapshot();
-          pendingImages.push(...currentSnap.images);
-          textResult = `Texte "${textToType}" saisi.\n${currentSnap.text}`;
-          actionsLog.push(`Exécuté : TypeRaw("${textToType}", enter=${pressEnter}, tab=${pressTab})`);
-        } else if (fnName === 'ClickPerMille') {
-          const x_raw = Number(fnArgs.x_permille);
-          const y_raw = Number(fnArgs.y_permille);
-          const x_pixel = Math.round((x_raw / 1000) * state.screenDimensions.width);
-          const y_pixel = Math.round((y_raw / 1000) * state.screenDimensions.height);
-
-          addLog(`🎯 Clic (${x_raw}‰, ${y_raw}‰) -> pixels (${x_pixel}, ${y_pixel})`);
-          await mcpClient.callTool({
-            name: 'Click',
-            arguments: { loc: [x_pixel, y_pixel] },
-          });
-          await sleep(1000);
-          currentSnap = await takeFreshSnapshot();
-          pendingImages.push(...currentSnap.images);
-          textResult = `Clic effectué à (${x_raw}‰, ${y_raw}‰).\n${currentSnap.text}`;
-          actionsLog.push(`Exécuté : ClickPerMille(${x_raw}‰, ${y_raw}‰)`);
-        } else if (fnName === 'Shortcut') {
-          const sc = String(fnArgs.shortcut || '');
-          if (!sendKeyShortcutReliable(sc)) {
-            await mcpClient.callTool({ name: 'Shortcut', arguments: fnArgs });
-          }
-          await sleep(1000);
-          currentSnap = await takeFreshSnapshot();
-          pendingImages.push(...currentSnap.images);
-          textResult = `Raccourci "${sc}" exécuté.\n${currentSnap.text}`;
-          actionsLog.push(`Exécuté : Shortcut("${sc}")`);
-        } else if (fnName === 'ask_gemini_web') {
-          textResult = await askGeminiWeb(String(fnArgs.prompt || ''));
-          actionsLog.push(`Exécuté : ask_gemini_web`);
-        } else if (fnName === 'RecallPastConversation') {
-          const q = String(fnArgs.query || '');
-          const cId = String(fnArgs.conversationId || '');
-          const t = fnArgs.fileType === 'log' ? 'log' : 'chat';
-          if (cId) {
-            textResult = readPastConversationDetails(cId, t);
-          } else {
-            textResult = searchPastConversations(q);
-          }
-          actionsLog.push(`Exécuté : RecallPastConversation(query="${q}", id="${cId}")`);
-        } else {
-          const mcpResult = await mcpClient.callTool({
-            name: fnName,
-            arguments: fnArgs,
-          });
-          await sleep(900);
-          currentSnap = await takeFreshSnapshot();
-          pendingImages.push(...currentSnap.images);
-          textResult = `${JSON.stringify(mcpResult.content || 'OK')}\n${currentSnap.text}`;
-          actionsLog.push(`Exécuté : ${fnName}(${JSON.stringify(fnArgs)})`);
-        }
-      } catch (err: unknown) {
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        addLog(`❌ Erreur Exécutant sur ${fnName}: ${errorMessage}`);
-        textResult = `Erreur: ${errorMessage}`;
-        actionsLog.push(`Erreur sur ${fnName}: ${errorMessage}`);
-      }
-
-      messages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        content: textResult,
-      });
+      addLog(`🛠️ [Exécutant -> Stratège] Fin de sous-tâche : ${textContent.split('\n')[0]}`);
+      actionsLog.push(`Note Exécutant : ${textContent}`);
+      break;
     }
 
-    if (pendingImages.length > 0) {
-      messages.push({
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: 'Voici le nouvel écran après ton action. Si la sous-tâche du Stratège est remplie, réponds [SOUS-TÂCHE TERMINÉE], sinon fais la prochaine action :',
-          },
-          ...pendingImages,
-        ],
-      });
+    // Exécution des outils
+    let anyExecuted = false;
+    for (const tool of callsToExecute) {
+      const sig = `${tool.name}(${JSON.stringify(tool.args)})`;
+      if (sig === lastActionSignature) {
+        repeatCount++;
+        if (repeatCount >= 2) {
+          addLog(`⚠️ [Exécutant] Action ${sig} répétée ${repeatCount} fois. Passage forcé à la suite.`);
+          messages.push({
+            role: 'user',
+            content: `Action ${sig} déjà effectuée. Ne la répète pas ! Passe immédiatement à l'action suivante (ex: TypeRaw pour coller le texte) ou réponds [SOUS-TÂCHE TERMINÉE].`,
+          });
+          continue;
+        }
+      } else {
+        lastActionSignature = sig;
+        repeatCount = 0;
+      }
+
+      addLog(`🛠️ [Exécutant Étape ${step + 1}/${maxSteps}] Exécution de ${tool.name} ${JSON.stringify(tool.args)}`);
+
+      try {
+        const { textResult, newSnap } = await executeSingleToolAction(tool.name, tool.args, openedUrlsInSubtask);
+        currentSnap = newSnap;
+        actionsLog.push(`Exécuté : ${tool.name}(${JSON.stringify(tool.args)})`);
+        anyExecuted = true;
+
+        if (tool.isNative && tool.id) {
+          messages.push({
+            role: 'tool',
+            tool_call_id: tool.id,
+            content: textResult,
+          });
+        }
+
+        // Renvoi du nouvel écran et incitation à enchaîner l'étape suivante
+        messages.push({
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `Action "${tool.name}" exécutée avec succès.\n${textResult}\nVoici le nouvel écran. Poursuis immédiatement la sous-tâche : effectue la prochaine action (ex: tape le texte avec TypeRaw, clique, etc.) ou réponds [SOUS-TÂCHE TERMINÉE] si tout est fini :`,
+            },
+            ...currentSnap.images,
+          ],
+        });
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        addLog(`❌ Erreur Exécutant sur ${tool.name}: ${errorMessage}`);
+        actionsLog.push(`Erreur sur ${tool.name}: ${errorMessage}`);
+        messages.push({
+          role: 'user',
+          content: `Erreur lors de l'exécution de ${tool.name}: ${errorMessage}. Essaie une autre méthode ou passe à la suite :`,
+        });
+      }
+    }
+
+    if (!anyExecuted && step > 0) {
+      break;
     }
   }
 
