@@ -9,6 +9,7 @@ import { addLog } from './logger.js';
 import { initScreenResolution } from './powershell.js';
 import { initMCP } from './mcp.js';
 import { runAgentTask } from './brain.js';
+import { syncLoadedModelAtStartup } from './vram.js';
 
 dotenv.config();
 
@@ -106,6 +107,7 @@ app.post('/command', requireSecret, async (req, res) => {
 initMCP(llm)
   .then(() => {
     initScreenResolution();
+    syncLoadedModelAtStartup();
     const port = Number(process.env.PORT) || 2999;
     const host = process.env.BIND_HOST || '0.0.0.0';
     app.listen(port, host, () => {

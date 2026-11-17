@@ -23,30 +23,69 @@ export function resolveLmsCliPath(): string {
   return 'lms';
 }
 
+export function getLoadedModelsViaCli(): Array<{ id: string; key: string; parallel?: number }> {
+  try {
+    const lmsCmd = resolveLmsCliPath();
+    const stdout = execSync(`${lmsCmd} ps --json`, { stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000 }).toString();
+    const data = JSON.parse(stdout);
+    if (Array.isArray(data)) {
+      return data
+        .filter((m: any) => m.type === 'llm')
+        .map((m: any) => ({
+          id: m.identifier || m.modelKey || '',
+          key: m.modelKey || m.identifier || '',
+          parallel: typeof m.parallel === 'number' ? m.parallel : undefined,
+        }));
+    }
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
+export function syncLoadedModelAtStartup(): void {
+  const loaded = getLoadedModelsViaCli();
+  if (loaded.length > 0 && loaded[0]) {
+    const first = loaded[0];
+    state.currentlyLoadedModel = first.id;
+    addLog(`⚡ [LM STUDIO] Modèle déjà chargé en mémoire au démarrage : "${first.id}" (Parallel: ${first.parallel ?? 'auto'})`);
+  } else {
+    addLog(`ℹ️ [LM STUDIO] Aucun modèle chargé en mémoire au démarrage.`);
+  }
+}
+
 export async function swapVramModel(
   llm: OpenAI,
   targetModelKey: string,
   roleLabel: 'STRATÈGE 🧠' | 'EXÉCUTANT 🛠️'
 ): Promise<string> {
-  try {
-    const loaded = await llm.models.list();
-    const match = loaded.data.find(
-      (m) => m.id.toLowerCase().includes(targetModelKey.toLowerCase())
-    );
-    if (match && state.currentlyLoadedModel === match.id) {
-      return match.id;
-    }
-    if (PLANNER_MODEL === EXECUTOR_MODEL && loaded.data.length > 0) {
-      const active = loaded.data.find((m) => !m.id.includes('embed')) || loaded.data[0];
-      if (active) {
-        state.currentlyLoadedModel = active.id;
-        return active.id;
-      }
-    }
-  } catch {
-    // ignore
+  const targetLower = targetModelKey.toLowerCase();
+
+  // 1. Déjà enregistré comme actif dans notre state interne ?
+  if (state.currentlyLoadedModel && state.currentlyLoadedModel.toLowerCase().includes(targetLower)) {
+    return state.currentlyLoadedModel;
   }
 
+  // 2. Vérification directe dans LM Studio via lms ps --json (~300ms)
+  const currentlyLoaded = getLoadedModelsViaCli();
+  const alreadyActive = currentlyLoaded.find(
+    (m) => m.id.toLowerCase().includes(targetLower) || m.key.toLowerCase().includes(targetLower)
+  );
+
+  if (alreadyActive) {
+    // Si déjà chargé mais avec Parallel > 1, on alerte et on recharge pour éviter le crash CUDA OOM
+    if (alreadyActive.parallel && alreadyActive.parallel > 1) {
+      addLog(
+        `⚠️ [ATTENTION] "${alreadyActive.id}" a été chargé avec Parallel: ${alreadyActive.parallel} (risque de crash CUDA OOM). Rechargement en Parallel: 1...`
+      );
+    } else {
+      state.currentlyLoadedModel = alreadyActive.id;
+      addLog(`⚡ [MODÈLE DÉJÀ PRÊT] ${roleLabel} déjà actif dans LM Studio : ${alreadyActive.id}`);
+      return alreadyActive.id;
+    }
+  }
+
+  // 3. Modèle absent ou mal configuré -> Swap nécessaire
   const lmsCmd = resolveLmsCliPath();
   const isLargeMoE = /26b|27b|30b|a4b|a3b/i.test(targetModelKey);
   const gpuFlag = isLargeMoE ? '' : '--gpu max';
@@ -69,15 +108,14 @@ export async function swapVramModel(
     });
     await sleep(800);
 
-    const modelsAfter = await llm.models.list();
+    const afterList = getLoadedModelsViaCli();
     const active =
-      modelsAfter.data.find((m) => m.id.toLowerCase().includes(targetModelKey.toLowerCase())) ||
-      modelsAfter.data.find((m) => !m.id.includes('embed')) ||
-      modelsAfter.data[0];
+      afterList.find((m) => m.id.toLowerCase().includes(targetLower) || m.key.toLowerCase().includes(targetLower)) ||
+      afterList[0];
 
     if (active) {
       state.currentlyLoadedModel = active.id;
-      addLog(`✅ [MODÈLE PRÊT] ${roleLabel} actif : ${active.id}`);
+      addLog(`✅ [MODÈLE PRÊT] ${roleLabel} actif : ${active.id} (Parallel: ${active.parallel ?? 1})`);
       return active.id;
     }
   } catch (err: unknown) {
@@ -97,5 +135,6 @@ export async function swapVramModel(
     }
   }
 
+  state.currentlyLoadedModel = targetModelKey;
   return targetModelKey;
 }
