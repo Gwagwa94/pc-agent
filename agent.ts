@@ -16,6 +16,14 @@ import {
   setPlannerModel,
   getAvailableLlmModels,
 } from './vram.js';
+import {
+  createConversation,
+  getConversation,
+  listConversations,
+  addMessageToConversation,
+  deleteConversation,
+  initConversationsSystem,
+} from './conversations.js';
 
 dotenv.config();
 
@@ -110,22 +118,62 @@ app.post('/model', requireSecret, (req, res) => {
   res.json({ status: 'ok', currentPlanner: PLANNER_MODEL });
 });
 
+// ── Gestion des Conversations (ChatGPT / Gemini style) ──────────────────────
+app.get('/conversations', requireSecret, (_req, res) => {
+  res.json({ conversations: listConversations() });
+});
+
+app.post('/conversations', requireSecret, (req, res) => {
+  const title = (req.body?.title as string) || 'Nouvelle discussion';
+  const conv = createConversation(title);
+  res.json(conv);
+});
+
+app.get('/conversations/:id', requireSecret, (req, res) => {
+  const id = String(req.params.id || '');
+  const conv = getConversation(id);
+  if (!conv) {
+    return res.status(404).json({ error: 'Conversation non trouvée' });
+  }
+  res.json(conv);
+});
+
+app.delete('/conversations/:id', requireSecret, (req, res) => {
+  const id = String(req.params.id || '');
+  const success = deleteConversation(id);
+  res.json({ success });
+});
+
 app.post('/command', requireSecret, async (req, res) => {
-  const { instruction } = req.body;
-  if (!instruction) {
+  const { instruction, conversationId } = req.body;
+  if (!instruction || typeof instruction !== 'string') {
     return res.status(400).json({ error: 'Paramètre "instruction" manquant' });
   }
 
+  // Si pas d'ID fourni, on crée une nouvelle discussion
+  let activeConvId = conversationId as string | undefined;
+  if (!activeConvId || !getConversation(activeConvId)) {
+    const newConv = createConversation();
+    activeConvId = newConv.id;
+  }
+
+  // 1. Enregistre le message utilisateur dans la discussion
+  addMessageToConversation(activeConvId, 'user', instruction);
+
   state.isAgentBusy = true;
-  addLog(`📩 Nouvel ordre reçu : "${instruction}"`);
+  addLog(`📩 [${activeConvId}] Nouvel ordre reçu : "${instruction}"`);
+
   try {
-    const result = await runAgentTask(llm, instruction);
-    addLog(`✅ Résultat final : ${result}`);
-    res.json({ status: 'ok', result });
+    const result = await runAgentTask(llm, instruction, activeConvId);
+    // 2. Enregistre la réponse de l'agent dans la discussion (txt & json)
+    addMessageToConversation(activeConvId, 'assistant', result);
+    addLog(`✅ [${activeConvId}] Résultat final : ${result.slice(0, 150)}`);
+    res.json({ status: 'ok', result, conversationId: activeConvId });
   } catch (err: unknown) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     addLog(`❌ Erreur globale: ${errorMessage}`);
-    res.status(500).json({ status: 'error', error: errorMessage });
+    addMessageToConversation(activeConvId, 'system', `Erreur : ${errorMessage}`);
+    res.status(500).json({ status: 'error', error: errorMessage, conversationId: activeConvId });
   } finally {
     state.isAgentBusy = false;
   }
@@ -133,6 +181,7 @@ app.post('/command', requireSecret, async (req, res) => {
 
 initMCP(llm)
   .then(() => {
+    initConversationsSystem();
     initScreenResolution();
     syncLoadedModelAtStartup();
     const port = Number(process.env.PORT) || 2999;

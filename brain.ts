@@ -5,8 +5,18 @@ import { PLANNER_MODEL, EXECUTOR_MODEL, swapVramModel } from './vram.js';
 import { mcpClient, allAvailableTools, takeFreshSnapshot, pruneOldSnapshots } from './mcp.js';
 import { openUrlInChrome, typeTextViaClipboard, sendKeyShortcutReliable } from './windows.js';
 import { askGeminiWeb } from './gemini.js';
+import fs from 'fs';
+import path from 'path';
 import { getForegroundWindowTitle } from './powershell.js';
 import type { PlannerDecision, SnapResult } from './types.js';
+import {
+  getConversation,
+  logConversationAction,
+  saveConversationSnapshot,
+  searchPastConversations,
+  readPastConversationDetails,
+  type ChatMessage,
+} from './conversations.js';
 
 function isSimpleGreeting(text: string): string | null {
   const trimmed = text.trim().toLowerCase().replace(/[!?.,;:\s]+$/, '');
@@ -34,7 +44,8 @@ export async function askPlanner(
   llm: OpenAI,
   userGoal: string,
   executionHistory: string[],
-  currentSnap: { text: string; images: OpenAI.Chat.Completions.ChatCompletionContentPartImage[] }
+  currentSnap: { text: string; images: OpenAI.Chat.Completions.ChatCompletionContentPartImage[] },
+  chatHistory?: ChatMessage[]
 ): Promise<PlannerDecision> {
   const plannerModelId = await swapVramModel(llm, PLANNER_MODEL, 'STRATÈGE 🧠');
 
@@ -55,6 +66,7 @@ CATALOGUE COMPLET DES OUTILS POUR L'EXÉCUTANT :
 - "Scroll" : Fait défiler la page.
 - "App" : Lance ou bascule vers une application Windows hors navigateur.
 - "PowerShell" : Exécute une commande système Windows.
+- "RecallPastConversation" : Consulte les archives (conversation.txt / execution.log) des sessions passées pour se souvenir d'une information.
 
 RÈGLES STRATÉGIQUES D'OPTIMISATION DE TEMPS :
 CONSIGNE DE CONCISITÉ ABSOLUE : Tu es un routeur stratégique rapide, PAS un rédacteur. Ne fais AUCUN long monologue intérieur. Réponds immédiatement un JSON compact.
@@ -81,15 +93,31 @@ Format JSON STRICT (sans texte autour) :
   "final_response": "Réponse finale pour Grégoire si status est DONE ou FAILED"
 }`;
 
+  let chatContext = '';
+  if (chatHistory && chatHistory.length > 0) {
+    const previousExchanges = chatHistory.filter((m) => m.content !== userGoal).slice(-6);
+    if (previousExchanges.length > 0) {
+      chatContext =
+        `CONTEXTE DE LA DISCUSSION EN COURS AVEC GRÉGOIRE :\n` +
+        previousExchanges
+          .map((m) => `- ${m.role === 'user' ? 'Grégoire' : 'Agent'} : "${m.content.slice(0, 180)}"`)
+          .join('\n') +
+        `\n\n`;
+    }
+  }
+
   const historyText =
     executionHistory.length > 0
-      ? `HISTORIQUE DES CYCLES PRÉCÉDENTS :\n${executionHistory.join('\n')}`
-      : `AUCUNE ACTION EXÉCUTÉE POUR LE MOMENT (Cycle initial).`;
+      ? `HISTORIQUE DES ACTIONS DE CE CYCLE :\n${executionHistory.join('\n')}`
+      : `AUCUNE ACTION EXÉCUTÉE DANS CE CYCLE (Phase initiale).`;
 
   const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
     {
       type: 'text',
-      text: `OBJECTIF GLOBAL DE GRÉGOIRE : "${userGoal}"\n\n${historyText}\n\nÉTAT ACTUEL DE L'ÉCRAN :\n${currentSnap.text || '(Aucune capture visuelle pour l’instant - réponds NEED_SNAPSHOT si tu as besoin de voir l’écran)'}\n\nDonne ta décision stratégique en JSON :`,
+      text: `${chatContext}OBJECTIF ACTUEL DE GRÉGOIRE : "${userGoal}"\n\n${historyText}\n\nÉTAT ACTUEL DE L'ÉCRAN :\n${
+        currentSnap.text ||
+        '(Aucune capture visuelle pour l’instant - réponds NEED_SNAPSHOT si tu as besoin de voir l’écran)'
+      }\n\nDonne ta décision stratégique en JSON :`,
     },
   ];
 
@@ -309,6 +337,16 @@ RÈGLES D'EXÉCUTION :
         } else if (fnName === 'ask_gemini_web') {
           textResult = await askGeminiWeb(String(fnArgs.prompt || ''));
           actionsLog.push(`Exécuté : ask_gemini_web`);
+        } else if (fnName === 'RecallPastConversation') {
+          const q = String(fnArgs.query || '');
+          const cId = String(fnArgs.conversationId || '');
+          const t = fnArgs.fileType === 'log' ? 'log' : 'chat';
+          if (cId) {
+            textResult = readPastConversationDetails(cId, t);
+          } else {
+            textResult = searchPastConversations(q);
+          }
+          actionsLog.push(`Exécuté : RecallPastConversation(query="${q}", id="${cId}")`);
         } else {
           const mcpResult = await mcpClient.callTool({
             name: fnName,
@@ -354,13 +392,23 @@ RÈGLES D'EXÉCUTION :
   };
 }
 
-export async function runAgentTask(llm: OpenAI, userInstruction: string): Promise<string> {
+export async function runAgentTask(
+  llm: OpenAI,
+  userInstruction: string,
+  conversationId?: string
+): Promise<string> {
   // 1. Fast-Path immédiat pour salutations et tests simples (réponse < 10ms)
   const quick = isSimpleGreeting(userInstruction);
   if (quick) {
     addLog(`⚡ [Fast Path] Réponse instantanée : "${quick}"`);
+    if (conversationId) {
+      logConversationAction(conversationId, { thought: 'Fast Path salutation', result: quick });
+    }
     return quick;
   }
+
+  const conv = conversationId ? getConversation(conversationId) : null;
+  const chatHistory = conv?.messages;
 
   const MAX_CYCLES = 4;
   const globalHistory: string[] = [];
@@ -376,22 +424,40 @@ export async function runAgentTask(llm: OpenAI, userInstruction: string): Promis
   for (let cycle = 1; cycle <= MAX_CYCLES; cycle++) {
     addLog(`\n================= 🧠 CYCLE STRATÉGIQUE ${cycle}/${MAX_CYCLES} =================`);
 
-    // 1. Le Stratège (Gemma 4) décide d'abord en texte pur (ultra-rapide, ~1-2 secondes !)
-    const decision = await askPlanner(llm, userInstruction, globalHistory, currentSnap);
+    // 1. Le Stratège (Gemma 4 / UI-TARS) décide d'abord en texte pur avec le contexte de la conversation
+    const decision = await askPlanner(llm, userInstruction, globalHistory, currentSnap, chatHistory);
     addLog(`🧠 [Stratège] Pensée : ${decision.thought}`);
 
+    if (conversationId) {
+      logConversationAction(conversationId, {
+        cycle,
+        thought: decision.thought,
+        subtask: decision.subtask_instruction,
+      });
+    }
+
     if (decision.status === 'DONE') {
-      return decision.final_response || `✅ Mission accomplie : ${decision.thought}`;
+      const finalRes = decision.final_response || `✅ Mission accomplie : ${decision.thought}`;
+      if (conversationId) logConversationAction(conversationId, { cycle, result: finalRes });
+      return finalRes;
     }
 
     if (decision.status === 'FAILED') {
-      return decision.final_response || `❌ Échec constaté par le Stratège : ${decision.thought}`;
+      const failRes = decision.final_response || `❌ Échec constaté par le Stratège : ${decision.thought}`;
+      if (conversationId) logConversationAction(conversationId, { cycle, result: failRes });
+      return failRes;
     }
 
     // Si le Stratège a expressément demandé à voir l'écran :
     if (decision.status === 'NEED_SNAPSHOT') {
       addLog(`📸 [Stratège] Prise de capture d'écran requise pour analyser l'interface...`);
       currentSnap = await takeFreshSnapshot();
+      if (conversationId) {
+        const snapPath = path.join(process.cwd(), 'last_snapshot.png');
+        if (fs.existsSync(snapPath)) {
+          saveConversationSnapshot(conversationId, cycle, 'strategist_requested', fs.readFileSync(snapPath));
+        }
+      }
       globalHistory.push(`--- Cycle ${cycle} : Capture d'écran effectuée à la demande du Stratège (Fenêtre: "${currentSnap.fgTitle}"). ---`);
       continue;
     }
@@ -402,6 +468,12 @@ export async function runAgentTask(llm: OpenAI, userInstruction: string): Promis
     if (needsVisualSnap && currentSnap.images.length === 0) {
       addLog(`📸 Prise de capture visuelle pour l'Exécutant UI-TARS...`);
       currentSnap = await takeFreshSnapshot();
+      if (conversationId) {
+        const snapPath = path.join(process.cwd(), 'last_snapshot.png');
+        if (fs.existsSync(snapPath)) {
+          saveConversationSnapshot(conversationId, cycle, 'executor_visual', fs.readFileSync(snapPath));
+        }
+      }
     }
 
     const execResult = await runExecutorSubtask(
@@ -411,6 +483,13 @@ export async function runAgentTask(llm: OpenAI, userInstruction: string): Promis
       decision.max_steps,
       currentSnap
     );
+
+    if (conversationId) {
+      logConversationAction(conversationId, {
+        cycle,
+        action: execResult.summary.join(' | '),
+      });
+    }
 
     currentSnap = execResult.lastSnap;
     globalHistory.push(

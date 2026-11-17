@@ -326,13 +326,52 @@ app.post('/api/model', requireAuth, async (req, res) => {
   }
 });
 
+// ── Proxy des Conversations (ChatGPT / Gemini style) ─────────────────────────
+app.get('/api/conversations', requireAuth, async (_req, res) => {
+  try {
+    const { status, contentType, data } = await proxyToAgent('GET', '/conversations');
+    res.status(status).type(contentType).send(data);
+  } catch (err) {
+    res.status(502).json({ error: 'PC agent unreachable', detail: String(err) });
+  }
+});
+
+app.post('/api/conversations', requireAuth, async (req, res) => {
+  try {
+    const { status, contentType, data } = await proxyToAgent('POST', '/conversations', req.body);
+    res.status(status).type(contentType).send(data);
+  } catch (err) {
+    res.status(502).json({ error: 'PC agent unreachable', detail: String(err) });
+  }
+});
+
+app.get('/api/conversations/:id', requireAuth, async (req, res) => {
+  const id = String(req.params.id || '');
+  try {
+    const { status, contentType, data } = await proxyToAgent('GET', `/conversations/${encodeURIComponent(id)}`);
+    res.status(status).type(contentType).send(data);
+  } catch (err) {
+    res.status(502).json({ error: 'PC agent unreachable', detail: String(err) });
+  }
+});
+
+app.delete('/api/conversations/:id', requireAuth, async (req, res) => {
+  const id = String(req.params.id || '');
+  try {
+    const { status, contentType, data } = await proxyToAgent('DELETE', `/conversations/${encodeURIComponent(id)}`);
+    res.status(status).type(contentType).send(data);
+  } catch (err) {
+    res.status(502).json({ error: 'PC agent unreachable', detail: String(err) });
+  }
+});
+
 app.post('/api/command', requireAuth, async (req, res) => {
   const { instruction } = req.body as { instruction?: string };
   if (!instruction?.trim()) {
     return res.status(400).json({ error: 'Paramètre "instruction" manquant' });
   }
   try {
-    const { status, contentType, data } = await proxyToAgent('POST', '/command', { instruction });
+    const { status, contentType, data } = await proxyToAgent('POST', '/command', req.body);
     res.status(status).type(contentType).send(data);
   } catch (err) {
     res.status(502).json({ error: 'PC agent unreachable', detail: String(err) });

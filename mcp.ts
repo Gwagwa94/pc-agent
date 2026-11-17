@@ -264,6 +264,22 @@ export async function initMCP(llm: OpenAI): Promise<void> {
           required: ['prompt'],
         },
       },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'RecallPastConversation',
+        description:
+          "Accède aux fichiers d'archives des discussions précédentes (conversation.txt ou execution.log) pour se souvenir d'un échange, d'un contexte ou d'une tâche passée.",
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Mot-clé ou sujet à chercher dans les discussions passées.' },
+            conversationId: { type: 'string', description: "ID du dossier de la conversation si déjà connu (ex: conv_...)." },
+            fileType: { type: 'string', enum: ['chat', 'log'], description: "'chat' pour lire conversation.txt, 'log' pour lire execution.log" },
+          },
+        },
+      },
     }
   );
 
