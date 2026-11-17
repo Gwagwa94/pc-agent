@@ -5,7 +5,30 @@ import { PLANNER_MODEL, EXECUTOR_MODEL, swapVramModel } from './vram.js';
 import { mcpClient, allAvailableTools, takeFreshSnapshot, pruneOldSnapshots } from './mcp.js';
 import { openUrlInChrome, typeTextViaClipboard, sendKeyShortcutReliable } from './windows.js';
 import { askGeminiWeb } from './gemini.js';
+import { getForegroundWindowTitle } from './powershell.js';
 import type { PlannerDecision, SnapResult } from './types.js';
+
+function isSimpleGreeting(text: string): string | null {
+  const trimmed = text.trim().toLowerCase().replace(/[!?.,;:\s]+$/, '');
+  const greetings = [
+    'hello', 'hi', 'hey', 'bonjour', 'salut', 'coucou', 'yo', 'bonsoir',
+    'test', 'ping', 'qui es-tu', 'qui es tu', 'qui est tu',
+    'ca va', 'ça va', 'comment vas-tu', 'comment tu vas'
+  ];
+  if (greetings.includes(trimmed)) {
+    const responses: Record<string, string> = {
+      hello: "Hello Grégoire ! Je suis ton agent autonome Dual-Brain. Que veux-tu que je fasse sur ton PC ?",
+      hi: "Hi ! Je suis connecté et prêt. Quelle tâche souhaites-tu lancer ?",
+      bonjour: "Bonjour Grégoire ! Je suis opérationnel sur ton PC Windows 11. Que puis-je faire pour toi ?",
+      bonsoir: "Bonsoir Grégoire ! Tout est prêt. Quel ordre souhaites-tu exécuter ?",
+      salut: "Salut Grégoire ! Je suis à ton écoute pour piloter le PC. Quel est ton objectif ?",
+      ping: "Pong 🏓 ! L'agent PC et la liaison WireGuard répondent instantanément.",
+      test: "Test reçu 5/5 ! Le système Dual-Brain et les outils Windows sont prêts.",
+    };
+    return responses[trimmed] || "Bonjour ! Je suis ton agent PC autonome. Dis-moi ce que tu veux faire !";
+  }
+  return null;
+}
 
 export async function askPlanner(
   llm: OpenAI,
@@ -19,10 +42,10 @@ export async function askPlanner(
     .map((t) => (t.type === 'function' ? t.function.name : ''))
     .filter(Boolean);
 
-  const systemPrompt = `Tu es le CERVEAU STRATÈGE (Architecte & Contrôleur) d'un agent PC sous Windows 11.
-Tu ne cliques pas toi-même : tu diriges un modèle EXÉCUTANT (UI-TARS) spécialisé en manipulation d'interface.
+  const systemPrompt = `Tu es le CERVEAU STRATÈGE (Architecte & Décideur) d'un agent autonome sous Windows 11.
+Tu ne cliques pas toi-même : tu réfléchis, tu analyses et tu diriges un modèle EXÉCUTANT (UI-TARS) spécialisé dans le clic GUI.
 
-CATALOGUE COMPLET DES OUTILS DISPONIBLES POUR L'EXÉCUTANT :
+CATALOGUE COMPLET DES OUTILS POUR L'EXÉCUTANT :
 - "ComposeGmail" : Ouvre directement la rédaction d'un email Gmail pré-rempli (to, subject, body) et envoie Ctrl+Entrée.
 - "OpenUrlInChrome" : Ouvre directement une URL (WhatsApp, Drive, YouTube...) dans Google Chrome.
 - "Click" : Clique sur un numéro de "label" exact listé dans "Interactive Elements" du Snapshot.
@@ -33,20 +56,26 @@ CATALOGUE COMPLET DES OUTILS DISPONIBLES POUR L'EXÉCUTANT :
 - "App" : Lance ou bascule vers une application Windows hors navigateur.
 - "PowerShell" : Exécute une commande système Windows.
 
-TON RÔLE À CHAQUE CYCLE :
-1. Observe l'objectif global de Grégoire, l'historique des actions déjà réalisées par l'Exécutant, et l'état actuel de l'écran.
-2. Décide si l'objectif global est DÉJÀ atteint ("status": "DONE"), impossible ("status": "FAILED"), ou s'il faut lancer un bloc d'exécution ("status": "CONTINUE").
-3. Si "CONTINUE" :
-   - Donne une instruction ultra-claire et séquentielle à l'Exécutant ("subtask_instruction").
-   - Choisis UNIQUEMENT les outils nécessaires ("allowed_tools") parmi ${JSON.stringify(allToolNames)} pour empêcher l'Exécutant de s'éparpiller !
-   - Fixe la limite maximale d'étapes ("max_steps", entre 1 et 8) que l'Exécutant a le droit d'utiliser avant de te rendre la main.
+RÈGLES STRATÉGIQUES D'OPTIMISATION DE TEMPS :
+1. Si l'ordre de Grégoire est une simple question, une salutation ou ne nécessite aucune manipulation du PC :
+   Réponds directement :
+   {"status": "DONE", "thought": "Aucune action PC requise.", "final_response": "Ta réponse directe"}
+2. Si tu as absolument besoin de voir visuellement l'écran pour comprendre ou trouver un élément graphique :
+   Réponds :
+   {"status": "NEED_SNAPSHOT", "thought": "J'ai besoin d'une capture d'écran pour localiser l'élément"}
+3. Si l'action peut être exécutée directement par un outil (ex: OpenUrlInChrome, ComposeGmail, PowerShell, App) sans avoir besoin de capture visuelle préalable :
+   Donne immédiatement la sous-tâche :
+   {"status": "CONTINUE", "subtask_instruction": "...", "allowed_tools": ["..."], "max_steps": 1}
+4. Si l'objectif global est déjà accompli :
+   Réponds :
+   {"status": "DONE", "thought": "...", "final_response": "..."}
 
-Réponds UNIQUEMENT avec un objet JSON valide (sans texte autour, ou dans un bloc json) au format exact :
+Format JSON STRICT (sans texte autour) :
 {
-  "status": "CONTINUE" | "DONE" | "FAILED",
-  "thought": "Ton analyse stratégique de l'écran actuel",
-  "subtask_instruction": "Consigne précise et directe pour l'Exécutant",
-  "allowed_tools": ["Outil1", "Outil2"],
+  "status": "CONTINUE" | "DONE" | "FAILED" | "NEED_SNAPSHOT",
+  "thought": "Ton analyse stratégique",
+  "subtask_instruction": "Consigne précise pour l'Exécutant si status=CONTINUE",
+  "allowed_tools": ["Outil1"],
   "max_steps": 4,
   "final_response": "Réponse finale pour Grégoire si status est DONE ou FAILED"
 }`;
@@ -56,6 +85,17 @@ Réponds UNIQUEMENT avec un objet JSON valide (sans texte autour, ou dans un blo
       ? `HISTORIQUE DES CYCLES PRÉCÉDENTS :\n${executionHistory.join('\n')}`
       : `AUCUNE ACTION EXÉCUTÉE POUR LE MOMENT (Cycle initial).`;
 
+  const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+    {
+      type: 'text',
+      text: `OBJECTIF GLOBAL DE GRÉGOIRE : "${userGoal}"\n\n${historyText}\n\nÉTAT ACTUEL DE L'ÉCRAN :\n${currentSnap.text || '(Aucune capture visuelle pour l’instant - réponds NEED_SNAPSHOT si tu as besoin de voir l’écran)'}\n\nDonne ta décision stratégique en JSON :`,
+    },
+  ];
+
+  if (currentSnap.images.length > 0) {
+    userContent.push(...currentSnap.images);
+  }
+
   const response = await llm.chat.completions.create({
     model: plannerModelId,
     temperature: 0.2,
@@ -63,13 +103,7 @@ Réponds UNIQUEMENT avec un objet JSON valide (sans texte autour, ou dans un blo
       { role: 'system', content: systemPrompt },
       {
         role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: `OBJECTIF GLOBAL DE GRÉGOIRE : "${userGoal}"\n\n${historyText}\n\nÉTAT ACTUEL DE L'ÉCRAN :\n${currentSnap.text}\n\nDonne ta décision stratégique en JSON :`,
-          },
-          ...currentSnap.images,
-        ],
+        content: userContent,
       },
     ],
   });
@@ -319,16 +353,29 @@ RÈGLES D'EXÉCUTION :
 }
 
 export async function runAgentTask(llm: OpenAI, userInstruction: string): Promise<string> {
+  // 1. Fast-Path immédiat pour salutations et tests simples (réponse < 10ms)
+  const quick = isSimpleGreeting(userInstruction);
+  if (quick) {
+    addLog(`⚡ [Fast Path] Réponse instantanée : "${quick}"`);
+    return quick;
+  }
+
   const MAX_CYCLES = 4;
   const globalHistory: string[] = [];
 
-  let currentSnap = await takeFreshSnapshot();
+  // Prise d'état ultra-légère au départ (titre de la fenêtre active sous Windows en 30ms, AUCUNE capture visuelle lourde !)
+  const initialFgTitle = getForegroundWindowTitle();
+  let currentSnap: SnapResult = {
+    text: initialFgTitle ? `📌 FENÊTRE ACTIVE CONFIRMÉE : "${initialFgTitle}"` : '',
+    images: [],
+    fgTitle: initialFgTitle,
+  };
 
   for (let cycle = 1; cycle <= MAX_CYCLES; cycle++) {
     addLog(`\n================= 🧠 CYCLE STRATÉGIQUE ${cycle}/${MAX_CYCLES} =================`);
 
+    // 1. Le Stratège (Gemma 4) décide d'abord en texte pur (ultra-rapide, ~1-2 secondes !)
     const decision = await askPlanner(llm, userInstruction, globalHistory, currentSnap);
-
     addLog(`🧠 [Stratège] Pensée : ${decision.thought}`);
 
     if (decision.status === 'DONE') {
@@ -337,6 +384,22 @@ export async function runAgentTask(llm: OpenAI, userInstruction: string): Promis
 
     if (decision.status === 'FAILED') {
       return decision.final_response || `❌ Échec constaté par le Stratège : ${decision.thought}`;
+    }
+
+    // Si le Stratège a expressément demandé à voir l'écran :
+    if (decision.status === 'NEED_SNAPSHOT') {
+      addLog(`📸 [Stratège] Prise de capture d'écran requise pour analyser l'interface...`);
+      currentSnap = await takeFreshSnapshot();
+      globalHistory.push(`--- Cycle ${cycle} : Capture d'écran effectuée à la demande du Stratège (Fenêtre: "${currentSnap.fgTitle}"). ---`);
+      continue;
+    }
+
+    // 2. Si le Stratège délègue à l'Exécutant (UI-TARS) :
+    // Si l'Exécutant a besoin d'outils de clic visuel mais qu'on n'a pas encore d'image :
+    const needsVisualSnap = decision.allowed_tools.some((t) => ['Click', 'ClickPerMille'].includes(t));
+    if (needsVisualSnap && currentSnap.images.length === 0) {
+      addLog(`📸 Prise de capture visuelle pour l'Exécutant UI-TARS...`);
+      currentSnap = await takeFreshSnapshot();
     }
 
     const execResult = await runExecutorSubtask(

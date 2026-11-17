@@ -1,7 +1,7 @@
 import type OpenAI from 'openai';
 
 export interface PlannerDecision {
-  status: 'CONTINUE' | 'DONE' | 'FAILED';
+  status: 'CONTINUE' | 'DONE' | 'FAILED' | 'NEED_SNAPSHOT';
   thought: string;
   subtask_instruction: string;
   allowed_tools: string[];
