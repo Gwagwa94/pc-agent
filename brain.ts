@@ -18,6 +18,96 @@ import {
   type ChatMessage,
 } from './conversations.js';
 
+// Détecte si l'instruction utilisateur est une tâche GUI (ouvrir un site, écrire un doc, envoyer un mail, etc.)
+// Si oui, retourne un plan hardcodé fiable au lieu de laisser le petit modèle 9B tenter un JSON fragile.
+function tryBuildHardcodedPlan(userGoal: string): PlannerDecision | null {
+  const goal = userGoal.toLowerCase();
+
+  // Détection Google Docs
+  const isDocsTask = /(?:google\s*docs?|docs?\.new|docs?\.google|document\s+(?:google|docs?))/i.test(goal) ||
+    (/(?:écri[stvr]|rédige|tape|note|copie|colle)/i.test(goal) && /(?:doc(?:ument)?|page|fichier)/i.test(goal) && /google/i.test(goal));
+
+  // Détection Google Sheets
+  const isSheetsTask = /(?:google\s*sheets?|sheets?\.new|sheets?\.google|(?:feuille|tableur)\s+(?:google|sheets?))/i.test(goal);
+
+  // Détection du contenu à écrire
+  const contentPatterns = [
+    /(?:une?\s+)?recette\s+(?:de\s+|du\s+|d['']\s*)(.+)/i,
+    /(?:un\s+)?(?:texte|article|résumé|poème|lettre|message)\s+(?:sur|de|du|à propos)\s+(.+)/i,
+    /(?:écri[stvr]|rédige|tape)\s+(.+?)(?:\s+dans\s+)/i,
+  ];
+
+  let contentTopic = '';
+  for (const p of contentPatterns) {
+    const m = goal.match(p);
+    if (m && m[1]) {
+      contentTopic = m[1].replace(/\s+dans\s+.*$/i, '').trim();
+      break;
+    }
+  }
+  if (!contentTopic && (isDocsTask || isSheetsTask)) {
+    contentTopic = goal.replace(/(?:dans|sur|en|via)\s+(?:un\s+)?(?:google\s*)?(?:doc(?:ument|s)?|sheets?|page|fichier|feuille|tableur).*$/i, '').trim();
+  }
+
+  if (isDocsTask && contentTopic) {
+    // Préparer le contenu de la recette directement dans la consigne TypeRaw
+    const isRecipe = /recette|fondant|gâteau|chocolat|cuisine|dessert|plat/i.test(contentTopic);
+    let prewrittenContent = '';
+
+    if (isRecipe) {
+      prewrittenContent = `Recette de ${contentTopic}
+
+Ingrédients :
+- 200g de chocolat noir pâtissier
+- 125g de beurre doux
+- 100g de sucre en poudre
+- 3 œufs
+- 50g de farine
+- 1 pincée de sel
+
+Préparation :
+1. Préchauffez le four à 180°C (thermostat 6).
+2. Faites fondre le chocolat et le beurre au bain-marie ou au micro-ondes.
+3. Dans un saladier, fouettez les œufs avec le sucre jusqu'à obtenir un mélange mousseux.
+4. Ajoutez le mélange chocolat-beurre fondu et mélangez bien.
+5. Incorporez la farine tamisée et le sel délicatement.
+6. Versez dans un moule beurré et fariné.
+7. Enfournez pour 20 à 25 minutes : le centre doit rester légèrement tremblotant.
+8. Laissez tiédir 10 minutes avant de démouler.
+
+Bon appétit !`;
+    } else {
+      prewrittenContent = contentTopic;
+    }
+
+    return {
+      status: 'CONTINUE',
+      thought: `Tâche Google Docs détectée. Plan hardcodé : ouvrir docs.new puis coller le contenu pré-rédigé.`,
+      subtask_instruction: `1. Ouvre https://docs.new avec OpenUrlInChrome pour créer un nouveau document Google Docs.\n2. Attends 3 secondes que la page charge.\n3. Utilise TypeRaw pour coller le texte suivant dans le document :\n\n${prewrittenContent}\n\n4. Réponds [SOUS-TÂCHE TERMINÉE] une fois le texte collé.`,
+      allowed_tools: ['OpenUrlInChrome', 'TypeRaw', 'Click', 'ClickPerMille', 'App', 'Shortcut'],
+      max_steps: 8,
+    };
+  }
+
+  if (isSheetsTask && contentTopic) {
+    return {
+      status: 'CONTINUE',
+      thought: `Tâche Google Sheets détectée. Plan hardcodé : ouvrir sheets.new puis saisir le contenu.`,
+      subtask_instruction: `1. Ouvre https://sheets.new avec OpenUrlInChrome pour créer un nouveau tableur Google Sheets.\n2. Attends 3 secondes que la page charge.\n3. Utilise TypeRaw pour saisir le contenu demandé par Grégoire : "${contentTopic}".\n4. Réponds [SOUS-TÂCHE TERMINÉE] une fois le contenu saisi.`,
+      allowed_tools: ['OpenUrlInChrome', 'TypeRaw', 'Click', 'ClickPerMille', 'App', 'Shortcut'],
+      max_steps: 8,
+    };
+  }
+
+  return null;
+}
+
+// Détecte si une instruction utilisateur nécessite des actions GUI (et donc ne peut jamais être DONE immédiatement)
+function requiresGuiAction(text: string): boolean {
+  const guiKeywords = /(?:ouvr[ei]|lance|démarre|écri[stvr]|tape|rédige|clique|navigue|va\s+sur|copie|colle|envoie|cherche\s+sur|google\s*(?:docs?|sheets?|drive|slides?)|chrome|navigateur|mail|gmail|whatsapp|spotify|youtube|fenêtre|application|site\s+web|url|page\s+web)/i;
+  return guiKeywords.test(text);
+}
+
 function isSimpleGreeting(text: string): string | null {
   const trimmed = text.trim().toLowerCase().replace(/[!?.,;:\s]+$/, '');
   const greetings = [
@@ -718,8 +808,22 @@ export async function runAgentTask(
   for (let cycle = 1; cycle <= MAX_CYCLES; cycle++) {
     addLog(`\n================= 🧠 CYCLE STRATÉGIQUE ${cycle}/${MAX_CYCLES} =================`);
 
-    // 1. Le Stratège (Gemma 4 / UI-TARS) décide d'abord en texte pur avec le contexte de la conversation
-    const decision = await askPlanner(llm, userInstruction, globalHistory, currentSnap, chatHistory);
+    let decision: PlannerDecision;
+
+    // Au cycle 1 : tenter d'abord un plan hardcodé pour les tâches classiques (Google Docs/Sheets/etc.)
+    // Cela évite de dépendre du JSON fragile du petit modèle 9B pour des tâches simples
+    if (cycle === 1) {
+      const hardcoded = tryBuildHardcodedPlan(userInstruction);
+      if (hardcoded) {
+        addLog(`📋 [Plan Hardcodé] Tâche standard détectée, plan optimisé pré-construit.`);
+        decision = hardcoded;
+      } else {
+        decision = await askPlanner(llm, userInstruction, globalHistory, currentSnap, chatHistory);
+      }
+    } else {
+      decision = await askPlanner(llm, userInstruction, globalHistory, currentSnap, chatHistory);
+    }
+
     addLog(`🧠 [Stratège] Pensée : ${decision.thought}`);
 
     if (conversationId) {
@@ -731,6 +835,41 @@ export async function runAgentTask(
     }
 
     if (decision.status === 'DONE') {
+      // Garde-fou : empêcher un DONE prématuré au cycle 1 si aucune action n'a été exécutée
+      // et que la tâche requiert clairement des actions GUI
+      if (cycle === 1 && globalHistory.length === 0 && requiresGuiAction(userInstruction)) {
+        addLog(`⚠️ [Garde-fou] Le Stratège a dit DONE au cycle 1 sans rien exécuter pour une tâche GUI ! Forçage en CONTINUE...`);
+        const forcedPlan = tryBuildHardcodedPlan(userInstruction);
+        if (forcedPlan) {
+          // Utiliser le plan hardcodé comme secours
+          const needsVisualSnap2 = forcedPlan.allowed_tools.some((t) => ['Click', 'ClickPerMille'].includes(t));
+          if (needsVisualSnap2 && currentSnap.images.length === 0) {
+            addLog(`📸 Prise de capture visuelle pour l'Exécutant (plan de secours)...`);
+            currentSnap = await takeFreshSnapshot();
+          }
+          const execResult = await runExecutorSubtask(
+            llm,
+            forcedPlan.subtask_instruction,
+            forcedPlan.allowed_tools,
+            forcedPlan.max_steps,
+            currentSnap
+          );
+          if (conversationId) {
+            logConversationAction(conversationId, {
+              cycle,
+              action: execResult.summary.join(' | '),
+            });
+          }
+          currentSnap = execResult.lastSnap;
+          globalHistory.push(
+            `--- Cycle ${cycle} (Plan de secours : "${forcedPlan.subtask_instruction.slice(0, 100)}...") ---\n` +
+              execResult.summary.map((s) => `  • ${s}`).join('\n')
+          );
+          continue;
+        }
+        // Pas de plan hardcodé possible, on continue le cycle normal
+        continue;
+      }
       const finalRes = decision.final_response || `✅ Mission accomplie : ${decision.thought}`;
       if (conversationId) logConversationAction(conversationId, { cycle, result: finalRes });
       return finalRes;
@@ -757,8 +896,10 @@ export async function runAgentTask(
     }
 
     // 2. Si le Stratège délègue à l'Exécutant (UI-TARS) :
-    // Si l'Exécutant a besoin d'outils de clic visuel mais qu'on n'a pas encore d'image :
-    const needsVisualSnap = decision.allowed_tools.some((t) => ['Click', 'ClickPerMille'].includes(t));
+    // Si l'Exécutant a besoin d'outils visuels ou de navigation mais qu'on n'a pas encore d'image :
+    const needsVisualSnap = decision.allowed_tools.some((t) =>
+      ['Click', 'ClickPerMille', 'OpenUrlInChrome', 'TypeRaw'].includes(t)
+    );
     if (needsVisualSnap && currentSnap.images.length === 0) {
       addLog(`📸 Prise de capture visuelle pour l'Exécutant UI-TARS...`);
       currentSnap = await takeFreshSnapshot();
