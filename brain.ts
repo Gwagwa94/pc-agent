@@ -69,28 +69,43 @@ CATALOGUE COMPLET DES OUTILS POUR L'EXÉCUTANT :
 - "RecallPastConversation" : Consulte les archives (conversation.txt / execution.log) des sessions passées pour se souvenir d'une information.
 
 RÈGLES STRATÉGIQUES ESSENTIELLES :
-1. NAVIGATION WEB & SERVICES GOOGLE (Google Sheets, Docs, YouTube, etc.) :
+1. STRATÉGIE DE PROGRAMMATION PAR BATCH (ANTI-SWAP VRAM) :
+   Pour éviter des allers-retours de swap VRAM inutiles, ne découpe pas une tâche logique en micro-étapes isolées !
+   Donne à l'Exécutant une séquence d'actions complète dans "subtask_instruction" qu'il exécutera en une seule session (fixe max_steps entre 4 et 8) :
+   Exemple :
+   "1. Ouvre 'https://sheets.new' avec OpenUrlInChrome.
+   2. Clique sur la première cellule ou zone de saisie.
+   3. Tape le titre et le contenu via TypeRaw ligne par ligne."
+   Allowed tools: ["OpenUrlInChrome", "Click", "ClickPerMille", "TypeRaw", "Shortcut"]
+   Max steps: 6
+   De cette façon, l'Exécutant déroule toute la séquence d'une traite en VRAM sans swap intermédiaire !
+
+2. NAVIGATION WEB & SERVICES GOOGLE (Google Sheets, Docs, YouTube, etc.) :
    Ne cherche JAMAIS à cliquer sur la barre des tâches ou sur l'icône Chrome !
    Utilise IMMÉDIATEMENT "OpenUrlInChrome" avec l'URL directe :
-   - Pour Google Sheets : subtask_instruction="Ouvre https://sheets.new dans Chrome", allowed_tools=["OpenUrlInChrome"], max_steps=1
-   - Pour Google Docs : subtask_instruction="Ouvre https://docs.new dans Chrome", allowed_tools=["OpenUrlInChrome"], max_steps=1
+   - Pour Google Sheets : subtask_instruction="1. Ouvre https://sheets.new dans Chrome. 2. Tape la recette dans les cellules...", allowed_tools=["OpenUrlInChrome", "Click", "ClickPerMille", "TypeRaw"], max_steps=5
+   - Pour Google Docs : subtask_instruction="1. Ouvre https://docs.new dans Chrome. 2. Tape le document...", allowed_tools=["OpenUrlInChrome", "TypeRaw"], max_steps=4
    - Pour tout site : donne l'URL directe avec "OpenUrlInChrome".
-2. SAISIE DE TEXTE :
-   Dès que le document ou le champ est ouvert et actif, donne l'instruction à l'Exécutant de saisir le texte avec "TypeRaw" (avec press_enter=true).
-3. QUESTION SIMPLE OU SALUTATION :
+
+3. GESTION DE TON BUDGET DE SORTIE :
+   - Ton budget de réponse est de 2048 tokens.
+   - Si la tâche nécessite d'écrire un contenu complet (recette, résumé, données), pré-rédige ce contenu directement dans la consigne de TypeRaw pour que l'Exécutant le colle d'un coup dans l'application !
+
+4. QUESTION SIMPLE OU SALUTATION :
    Si Grégoire pose une question ou salue sans manipulation requise, réponds directement :
    {"status": "DONE", "thought": "Réponse directe.", "final_response": "Ta réponse"}
-4. INSPECTION D'ÉCRAN :
-   Si tu as besoin de voir l'écran pour localiser un élément graphique :
+
+5. INSPECTION D'ÉCRAN :
+   Si tu as besoin de voir l'écran pour localiser un élément graphique avant d'ordonner la suite :
    {"status": "NEED_SNAPSHOT", "thought": "Capture requise"}
 
 Format JSON STRICT (sans texte autour) :
 {
   "status": "CONTINUE" | "DONE" | "FAILED" | "NEED_SNAPSHOT",
-  "thought": "Ton analyse stratégique concise",
-  "subtask_instruction": "Consigne précise pour l'Exécutant si status=CONTINUE",
-  "allowed_tools": ["OpenUrlInChrome"],
-  "max_steps": 2,
+  "thought": "Ton analyse stratégique",
+  "subtask_instruction": "Séquence complète et ordonnée pour l'Exécutant si status=CONTINUE",
+  "allowed_tools": ["OpenUrlInChrome", "TypeRaw", "ClickPerMille"],
+  "max_steps": 6,
   "final_response": "Réponse finale pour Grégoire si status est DONE ou FAILED"
 }`;
 
@@ -129,7 +144,7 @@ Format JSON STRICT (sans texte autour) :
   const response = await llm.chat.completions.create({
     model: plannerModelId,
     temperature: 0.1,
-    max_tokens: 500,
+    max_tokens: 2048,
     messages: [
       { role: 'system', content: systemPrompt },
       {
