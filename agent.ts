@@ -70,6 +70,7 @@ function requireSecret(req: express.Request, res: express.Response, next: expres
 const llm = new OpenAI({
   baseURL: process.env.LM_STUDIO_URL || 'http://127.0.0.1:1234/v1',
   apiKey: 'lm-studio',
+  timeout: 90000,
 });
 
 app.get('/', (_req, res) => {
