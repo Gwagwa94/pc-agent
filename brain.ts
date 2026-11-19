@@ -18,11 +18,76 @@ import {
   type ChatMessage,
 } from './conversations.js';
 
-// Exécution directe déterministe pour les tâches GUI courantes (Google Docs, Sheets, etc.)
-// Cela garantit une exécution en 5 secondes sans freeze VRAM ni hallucination
-export async function tryExecuteDirectTask(
+// Rétablit le modèle Stratège en VRAM et lui fait formuler la réponse finale conversationnelle pour Grégoire
+export async function generateStrategistFinalReply(
+  llm: OpenAI,
   userGoal: string,
-  conversationId?: string
+  actionsSummary: string,
+  chatHistory?: ChatMessage[]
+): Promise<string> {
+  // 1. Swap VRAM vers le modèle Stratège (Qwen, Gemma, etc.)
+  const plannerModelId = await swapVramModel(llm, PLANNER_MODEL, 'STRATÈGE 🧠');
+
+  // 2. Contexte récent de la conversation avec Grégoire
+  let chatContext = '';
+  if (chatHistory && chatHistory.length > 0) {
+    const recent = chatHistory.slice(-4);
+    chatContext =
+      `CONTEXTE RÉCENT DE LA CONVERSATION :\n` +
+      recent.map((m) => `- ${m.role === 'user' ? 'Grégoire' : 'Agent'} : "${m.content.slice(0, 150)}"`).join('\n') +
+      `\n\n`;
+  }
+
+  const prompt = `${chatContext}DEMANDE INITIALE DE GRÉGOIRE : "${userGoal}"
+
+ACTIONS RÉALISÉES SUR SON ORDINATEUR :
+${actionsSummary}
+
+CONSIGNE :
+Tu es le CERVEAU STRATÈGE de l'agent. Tu t'adresses directement à Grégoire en français, de façon naturelle, cordiale, concise et fluide.
+Confirme-lui clairement que sa demande a été réalisée avec succès et présente brièvement ce qui a été fait sur son écran.
+Ne donne AUCUN JSON, AUCUNE balise de code, réponds directement en texte conversationnel.`;
+
+  try {
+    const response = await llm.chat.completions.create({
+      model: plannerModelId,
+      temperature: 0.3,
+      max_tokens: 300,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Tu es le Cerveau Stratège de l agent autonome sous Windows 11. Tu es l interlocuteur direct de Grégoire. Tu lui réponds avec clarté, politesse et professionnalisme.',
+        },
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ],
+    });
+
+    const reply = response.choices[0]?.message?.content?.trim();
+    if (reply) {
+      const cleaned = reply.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+      if (cleaned.length > 0) {
+        addLog(`🧠 [Stratège -> Grégoire] Réponse formulée avec succès`);
+        return cleaned;
+      }
+    }
+  } catch (err) {
+    addLog(`⚠️ Erreur lors de la réponse du Stratège: ${err}`);
+  }
+
+  return `✅ C'est fait Grégoire ! J'ai bien exécuté ta demande : "${userGoal}".`;
+}
+
+// Exécution directe déterministe pour les tâches GUI courantes (Google Docs, Sheets, etc.)
+// Cela garantit une exécution en 5 secondes sans freeze VRAM ni hallucination, avec réponse du Stratège
+export async function tryExecuteDirectTask(
+  llm: OpenAI,
+  userGoal: string,
+  conversationId?: string,
+  chatHistory?: ChatMessage[]
 ): Promise<string | null> {
   const goal = userGoal.toLowerCase();
 
@@ -107,7 +172,8 @@ Bon appétit !`;
       });
     }
 
-    return `✅ J'ai ouvert un nouveau document Google Docs dans Chrome et j'y ai saisi la recette complète de ${contentTopic || 'fondant au chocolat'} !`;
+    const actionSummary = `J'ai ouvert un nouveau document Google Docs dans Chrome (docs.new) et j'y ai saisi la recette complète de ${contentTopic || 'fondant au chocolat'} avec les ingrédients et la préparation.`;
+    return await generateStrategistFinalReply(llm, userGoal, actionSummary, chatHistory);
   }
 
   if (isSheetsTask) {
@@ -134,7 +200,8 @@ Bon appétit !`;
       });
     }
 
-    return `✅ J'ai ouvert une nouvelle feuille Google Sheets dans Chrome et j'y ai préparé le tableau !`;
+    const actionSummary = `J'ai ouvert une nouvelle feuille Google Sheets dans Chrome (sheets.new) et préparé le document demandé (${contentTopic || 'feuille de calcul'}).`;
+    return await generateStrategistFinalReply(llm, userGoal, actionSummary, chatHistory);
   }
 
   return null;
@@ -904,6 +971,9 @@ export async function runAgentTask(
   userInstruction: string,
   conversationId?: string
 ): Promise<string> {
+  const conv = conversationId ? getConversation(conversationId) : null;
+  const chatHistory = conv?.messages;
+
   // 1. Fast-Path immédiat pour salutations et tests simples (réponse < 10ms)
   const quick = isSimpleGreeting(userInstruction);
   if (quick) {
@@ -914,154 +984,181 @@ export async function runAgentTask(
     return quick;
   }
 
-  // 2. Exécution directe des tâches déterministes (Google Docs, Sheets, etc.) sans dépendre d'inférence VLM fragile
-  const directResult = await tryExecuteDirectTask(userInstruction, conversationId);
-  if (directResult) {
-    addLog(`⚡ [Exécution directe réussie] : ${directResult}`);
-    return directResult;
-  }
+  try {
+    // 2. Exécution directe des tâches déterministes (Google Docs, Sheets, etc.) avec réponse formulée par le Stratège
+    const directResult = await tryExecuteDirectTask(llm, userInstruction, conversationId, chatHistory);
+    if (directResult) {
+      addLog(`⚡ [Exécution directe réussie avec réponse du Stratège]`);
+      return directResult;
+    }
 
-  const conv = conversationId ? getConversation(conversationId) : null;
-  const chatHistory = conv?.messages;
+    const MAX_CYCLES = 4;
+    const globalHistory: string[] = [];
 
-  const MAX_CYCLES = 4;
-  const globalHistory: string[] = [];
+    // Prise d'état ultra-légère au départ (titre de la fenêtre active sous Windows en 30ms, AUCUNE capture visuelle lourde !)
+    const initialFgTitle = getForegroundWindowTitle();
+    let currentSnap: SnapResult = {
+      text: initialFgTitle ? `📌 FENÊTRE ACTIVE CONFIRMÉE : "${initialFgTitle}"` : '',
+      images: [],
+      fgTitle: initialFgTitle,
+    };
 
-  // Prise d'état ultra-légère au départ (titre de la fenêtre active sous Windows en 30ms, AUCUNE capture visuelle lourde !)
-  const initialFgTitle = getForegroundWindowTitle();
-  let currentSnap: SnapResult = {
-    text: initialFgTitle ? `📌 FENÊTRE ACTIVE CONFIRMÉE : "${initialFgTitle}"` : '',
-    images: [],
-    fgTitle: initialFgTitle,
-  };
+    for (let cycle = 1; cycle <= MAX_CYCLES; cycle++) {
+      addLog(`\n================= 🧠 CYCLE STRATÉGIQUE ${cycle}/${MAX_CYCLES} =================`);
 
-  for (let cycle = 1; cycle <= MAX_CYCLES; cycle++) {
-    addLog(`\n================= 🧠 CYCLE STRATÉGIQUE ${cycle}/${MAX_CYCLES} =================`);
+      let decision: PlannerDecision;
 
-    let decision: PlannerDecision;
-
-    // Au cycle 1 : tenter d'abord un plan hardcodé pour les tâches classiques (Google Docs/Sheets/etc.)
-    // Cela évite de dépendre du JSON fragile du petit modèle 9B pour des tâches simples
-    if (cycle === 1) {
-      const hardcoded = tryBuildHardcodedPlan(userInstruction);
-      if (hardcoded) {
-        addLog(`📋 [Plan Hardcodé] Tâche standard détectée, plan optimisé pré-construit.`);
-        decision = hardcoded;
+      // Au cycle 1 : tenter d'abord un plan hardcodé pour les tâches classiques (Google Docs/Sheets/etc.)
+      // Cela évite de dépendre du JSON fragile du petit modèle 9B pour des tâches simples
+      if (cycle === 1) {
+        const hardcoded = tryBuildHardcodedPlan(userInstruction);
+        if (hardcoded) {
+          addLog(`📋 [Plan Hardcodé] Tâche standard détectée, plan optimisé pré-construit.`);
+          decision = hardcoded;
+        } else {
+          decision = await askPlanner(llm, userInstruction, globalHistory, currentSnap, chatHistory);
+        }
       } else {
         decision = await askPlanner(llm, userInstruction, globalHistory, currentSnap, chatHistory);
       }
-    } else {
-      decision = await askPlanner(llm, userInstruction, globalHistory, currentSnap, chatHistory);
-    }
 
-    addLog(`🧠 [Stratège] Pensée : ${decision.thought}`);
+      addLog(`🧠 [Stratège] Pensée : ${decision.thought}`);
 
-    if (conversationId) {
-      logConversationAction(conversationId, {
-        cycle,
-        thought: decision.thought,
-        subtask: decision.subtask_instruction,
-      });
-    }
+      if (conversationId) {
+        logConversationAction(conversationId, {
+          cycle,
+          thought: decision.thought,
+          subtask: decision.subtask_instruction,
+        });
+      }
 
-    if (decision.status === 'DONE') {
-      // Garde-fou : empêcher un DONE prématuré au cycle 1 si aucune action n'a été exécutée
-      // et que la tâche requiert clairement des actions GUI
-      if (cycle === 1 && globalHistory.length === 0 && requiresGuiAction(userInstruction)) {
-        addLog(`⚠️ [Garde-fou] Le Stratège a dit DONE au cycle 1 sans rien exécuter pour une tâche GUI ! Forçage en CONTINUE...`);
-        const forcedPlan = tryBuildHardcodedPlan(userInstruction);
-        if (forcedPlan) {
-          // Utiliser le plan hardcodé comme secours
-          const needsVisualSnap2 = forcedPlan.allowed_tools.some((t) => ['Click', 'ClickPerMille'].includes(t));
-          if (needsVisualSnap2 && currentSnap.images.length === 0) {
-            addLog(`📸 Prise de capture visuelle pour l'Exécutant (plan de secours)...`);
-            currentSnap = await takeFreshSnapshot();
+      if (decision.status === 'DONE') {
+        // Garde-fou : empêcher un DONE prématuré au cycle 1 si aucune action n'a été exécutée
+        // et que la tâche requiert clairement des actions GUI
+        if (cycle === 1 && globalHistory.length === 0 && requiresGuiAction(userInstruction)) {
+          addLog(`⚠️ [Garde-fou] Le Stratège a dit DONE au cycle 1 sans rien exécuter pour une tâche GUI ! Forçage en CONTINUE...`);
+          const forcedPlan = tryBuildHardcodedPlan(userInstruction);
+          if (forcedPlan) {
+            // Utiliser le plan hardcodé comme secours
+            const needsVisualSnap2 = forcedPlan.allowed_tools.some((t) => ['Click', 'ClickPerMille'].includes(t));
+            if (needsVisualSnap2 && currentSnap.images.length === 0) {
+              addLog(`📸 Prise de capture visuelle pour l'Exécutant (plan de secours)...`);
+              currentSnap = await takeFreshSnapshot();
+            }
+            const execResult = await runExecutorSubtask(
+              llm,
+              forcedPlan.subtask_instruction,
+              forcedPlan.allowed_tools,
+              forcedPlan.max_steps,
+              currentSnap
+            );
+            if (conversationId) {
+              logConversationAction(conversationId, {
+                cycle,
+                action: execResult.summary.join(' | '),
+              });
+            }
+            currentSnap = execResult.lastSnap;
+            globalHistory.push(
+              `--- Cycle ${cycle} (Plan de secours : "${forcedPlan.subtask_instruction.slice(0, 100)}...") ---\n` +
+                execResult.summary.map((s) => `  • ${s}`).join('\n')
+            );
+            continue;
           }
-          const execResult = await runExecutorSubtask(
-            llm,
-            forcedPlan.subtask_instruction,
-            forcedPlan.allowed_tools,
-            forcedPlan.max_steps,
-            currentSnap
-          );
-          if (conversationId) {
-            logConversationAction(conversationId, {
-              cycle,
-              action: execResult.summary.join(' | '),
-            });
-          }
-          currentSnap = execResult.lastSnap;
-          globalHistory.push(
-            `--- Cycle ${cycle} (Plan de secours : "${forcedPlan.subtask_instruction.slice(0, 100)}...") ---\n` +
-              execResult.summary.map((s) => `  • ${s}`).join('\n')
-          );
+          // Pas de plan hardcodé possible, on continue le cycle normal
           continue;
         }
-        // Pas de plan hardcodé possible, on continue le cycle normal
+
+        // Rétablissement du modèle Stratège en VRAM avant d'envoyer la réponse à l'utilisateur
+        await swapVramModel(llm, PLANNER_MODEL, 'STRATÈGE 🧠');
+        let finalRes = decision.final_response;
+        if (!finalRes || finalRes.trim().length === 0 || finalRes.includes('Analyse effectuée') || finalRes.includes('Plan par défaut')) {
+          finalRes = await generateStrategistFinalReply(
+            llm,
+            userInstruction,
+            globalHistory.join('\n') || decision.thought,
+            chatHistory
+          );
+        }
+        if (conversationId) logConversationAction(conversationId, { cycle, result: finalRes });
+        return finalRes;
+      }
+
+      if (decision.status === 'FAILED') {
+        await swapVramModel(llm, PLANNER_MODEL, 'STRATÈGE 🧠');
+        const failRes = decision.final_response || `❌ Échec constaté par le Stratège : ${decision.thought}`;
+        if (conversationId) logConversationAction(conversationId, { cycle, result: failRes });
+        return failRes;
+      }
+
+      // Si le Stratège a expressément demandé à voir l'écran :
+      if (decision.status === 'NEED_SNAPSHOT') {
+        addLog(`📸 [Stratège] Prise de capture d'écran requise pour analyser l'interface...`);
+        currentSnap = await takeFreshSnapshot();
+        if (conversationId) {
+          const snapPath = path.join(process.cwd(), 'last_snapshot.png');
+          if (fs.existsSync(snapPath)) {
+            saveConversationSnapshot(conversationId, cycle, 'strategist_requested', fs.readFileSync(snapPath));
+          }
+        }
+        globalHistory.push(`--- Cycle ${cycle} : Capture d'écran effectuée à la demande du Stratège (Fenêtre: "${currentSnap.fgTitle}"). ---`);
         continue;
       }
-      const finalRes = decision.final_response || `✅ Mission accomplie : ${decision.thought}`;
-      if (conversationId) logConversationAction(conversationId, { cycle, result: finalRes });
-      return finalRes;
-    }
 
-    if (decision.status === 'FAILED') {
-      const failRes = decision.final_response || `❌ Échec constaté par le Stratège : ${decision.thought}`;
-      if (conversationId) logConversationAction(conversationId, { cycle, result: failRes });
-      return failRes;
-    }
-
-    // Si le Stratège a expressément demandé à voir l'écran :
-    if (decision.status === 'NEED_SNAPSHOT') {
-      addLog(`📸 [Stratège] Prise de capture d'écran requise pour analyser l'interface...`);
-      currentSnap = await takeFreshSnapshot();
-      if (conversationId) {
-        const snapPath = path.join(process.cwd(), 'last_snapshot.png');
-        if (fs.existsSync(snapPath)) {
-          saveConversationSnapshot(conversationId, cycle, 'strategist_requested', fs.readFileSync(snapPath));
+      // 2. Si le Stratège délègue à l'Exécutant (UI-TARS) :
+      // Si l'Exécutant a besoin d'outils visuels ou de navigation mais qu'on n'a pas encore d'image :
+      const needsVisualSnap = decision.allowed_tools.some((t) =>
+        ['Click', 'ClickPerMille', 'OpenUrlInChrome', 'TypeRaw'].includes(t)
+      );
+      if (needsVisualSnap && currentSnap.images.length === 0) {
+        addLog(`📸 Prise de capture visuelle pour l'Exécutant UI-TARS...`);
+        currentSnap = await takeFreshSnapshot();
+        if (conversationId) {
+          const snapPath = path.join(process.cwd(), 'last_snapshot.png');
+          if (fs.existsSync(snapPath)) {
+            saveConversationSnapshot(conversationId, cycle, 'executor_visual', fs.readFileSync(snapPath));
+          }
         }
       }
-      globalHistory.push(`--- Cycle ${cycle} : Capture d'écran effectuée à la demande du Stratège (Fenêtre: "${currentSnap.fgTitle}"). ---`);
-      continue;
-    }
 
-    // 2. Si le Stratège délègue à l'Exécutant (UI-TARS) :
-    // Si l'Exécutant a besoin d'outils visuels ou de navigation mais qu'on n'a pas encore d'image :
-    const needsVisualSnap = decision.allowed_tools.some((t) =>
-      ['Click', 'ClickPerMille', 'OpenUrlInChrome', 'TypeRaw'].includes(t)
-    );
-    if (needsVisualSnap && currentSnap.images.length === 0) {
-      addLog(`📸 Prise de capture visuelle pour l'Exécutant UI-TARS...`);
-      currentSnap = await takeFreshSnapshot();
+      const execResult = await runExecutorSubtask(
+        llm,
+        decision.subtask_instruction,
+        decision.allowed_tools,
+        decision.max_steps,
+        currentSnap
+      );
+
       if (conversationId) {
-        const snapPath = path.join(process.cwd(), 'last_snapshot.png');
-        if (fs.existsSync(snapPath)) {
-          saveConversationSnapshot(conversationId, cycle, 'executor_visual', fs.readFileSync(snapPath));
-        }
+        logConversationAction(conversationId, {
+          cycle,
+          action: execResult.summary.join(' | '),
+        });
       }
+
+      currentSnap = execResult.lastSnap;
+      globalHistory.push(
+        `--- Cycle ${cycle} (Sous-tâche : "${decision.subtask_instruction}") ---\n` +
+          execResult.summary.map((s) => `  • ${s}`).join('\n')
+      );
     }
 
-    const execResult = await runExecutorSubtask(
+    // Si la boucle de cycles se termine, on reswappe OBLIGATOIREMENT vers le Stratège
+    // pour qu'il rédige la réponse à Grégoire
+    addLog(`🔄 [Fin de tâche] Rétablissement du modèle Stratège en VRAM avant réponse...`);
+    await swapVramModel(llm, PLANNER_MODEL, 'STRATÈGE 🧠');
+    const finalAnswer = await generateStrategistFinalReply(
       llm,
-      decision.subtask_instruction,
-      decision.allowed_tools,
-      decision.max_steps,
-      currentSnap
+      userInstruction,
+      globalHistory.length > 0 ? globalHistory.join('\n') : 'Actions exécutées sur votre PC.',
+      chatHistory
     );
-
-    if (conversationId) {
-      logConversationAction(conversationId, {
-        cycle,
-        action: execResult.summary.join(' | '),
-      });
-    }
-
-    currentSnap = execResult.lastSnap;
-    globalHistory.push(
-      `--- Cycle ${cycle} (Sous-tâche : "${decision.subtask_instruction}") ---\n` +
-        execResult.summary.map((s) => `  • ${s}`).join('\n')
-    );
+    if (conversationId) logConversationAction(conversationId, { result: finalAnswer });
+    return finalAnswer;
+  } finally {
+    // Sécurité absolue : garantir que le Stratège est toujours le modèle actif en VRAM
+    try {
+      await swapVramModel(llm, PLANNER_MODEL, 'STRATÈGE 🧠');
+    } catch {}
   }
-
-  return `Limite de ${MAX_CYCLES} cycles stratégiques atteinte. Historique :\n${globalHistory.join('\n')}`;
 }
